@@ -1,14 +1,15 @@
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -969,8 +969,17 @@
+@@ -969,8 +969,18 @@
  #undef panic
  void
  panic(const char *str, ...)
  {
 +	/*
-+	 * SWEET: persist the log ring before anything else. When this panic ends
-+	 * the run, the ring holds the lines that explain it and the periodic
-+	 * flusher never gets to run again.
++	 * SWEET: persist the log ring twice. This first call runs before the panic
++	 * text exists, and still preserves everything that led here; the second one
++	 * (in kdp_machine_reboot_type) runs after the text has been printed, so the
++	 * reason survives too.
 +	 */
 +	{
 +		extern void sweet_log_panic_flush(void);
@@ -18,3 +19,20 @@
  
  	va_start(panic_str_args, str);
  	panic_trap_to_debugger(str, &panic_str_args, 0, NULL, 0, NULL, (unsigned long)(char *)__builtin_return_address(0));
+@@ -1170,8 +1180,16 @@
+ 
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++	/*
++	 * SWEET: the panic text is in the ring by now; write it before the machine
++	 * goes down.
++	 */
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+ 		PEHaltRestart(type);
