@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1004,8 +1004,44 @@
+ 	os_atomic_store(&sweet_log_flushing, 0, relaxed);
+ 	return error ? 1 : 0;
+ }
+ 
++/* Sampling thread: a kernel thread driven by an absolute deadline, which does
++ * work in this port (the tick based sleeps never expire). Every round dumps the
++ * user stacks of the processes named by the sweetsample boot argument. */
++static int sweet_sample_chan;
++
++static void
++sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (int i = 0; i < 20; i++) {
++		uint64_t deadline;
++		clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
++		assert_wait_deadline(&sweet_sample_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		printf("SWEET SMP: sample round %d\n", i);
++		{
++			extern void sweet_sample_now(void);
++			sweet_sample_now();
++		}
++	}
++}
++
++static void
++sweet_sample_kick(void)
++{
++	static int started;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static void
+ sweet_log_start(void)
+ {
+ 	uint32_t on = 1;
+@@ -1024,8 +1060,9 @@
+ 	if (0) {
+ 		sweet_dump_file();
+ 	}
+ 	sweet_log_flush_to_disk();
++	sweet_sample_kick();
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
