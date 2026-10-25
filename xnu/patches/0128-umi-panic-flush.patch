@@ -1,0 +1,20 @@
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -969,8 +969,17 @@
+ #undef panic
+ void
+ panic(const char *str, ...)
+ {
++	/*
++	 * SWEET: persist the log ring before anything else. When this panic ends
++	 * the run, the ring holds the lines that explain it and the periodic
++	 * flusher never gets to run again.
++	 */
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
+ 	va_list panic_str_args;
+ 
+ 	va_start(panic_str_args, str);
+ 	panic_trap_to_debugger(str, &panic_str_args, 0, NULL, 0, NULL, (unsigned long)(char *)__builtin_return_address(0));
