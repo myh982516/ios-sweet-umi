@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -163,8 +163,68 @@
+@@ -163,8 +163,77 @@
  		    pname[p], kids_n, disp);
  	}
  }
@@ -14,6 +14,9 @@
 +static volatile uint32_t *sweet_hb_fb;
 +static uint32_t sweet_hb_row, sweet_hb_w, sweet_hb_h;
 +extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/console/serial_console.c: non-zero stops drawing text on the panel
++ * (the ring log still gets every byte). */
++extern int sweet_console_muted;
 +
 +static void
 +sweet_hb_map(void)
@@ -36,6 +39,12 @@
 +	sweet_hb_h = (uint32_t)video.v_height;
 +	sweet_hb_row = (uint32_t)video.v_rowBytes / 4;
 +	sweet_hb_fb = (volatile uint32_t *)va;
++	/*
++	 * The text console paints the whole panel, including this bar, so stop it
++	 * from drawing: otherwise the heartbeat is erased by the next printf and a
++	 * frozen screen looks like a hung kernel with no blocks at all.
++	 */
++	sweet_console_muted = 1;
 +}
 +
 +/* n filled blocks out of 64 along the top-left edge (a8r8g8b8). */
