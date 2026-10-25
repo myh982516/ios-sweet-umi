@@ -74,7 +74,7 @@
  			}
  		}
  	}
-@@ -1005,6 +1058,141 @@
+@@ -1005,6 +1058,138 @@
  	return error ? 1 : 0;
  }
  
@@ -151,17 +151,17 @@
 +{
 +	static const struct {
 +		const char *name;
-+		uint32_t svc, cmd;
-+		int header;			/* x1 = (nargs << 24) | 1 */
-+		uint32_t nargs;
-+		uint64_t arg0, arg1;
++		uint64_t x0, x1, x2, x3;
 +	} tries[] = {
-+		{ "svc1/cmd2 hdr mode1", 1, 2, 1, 2, 1, 0 },
-+		{ "svc1/cmd2 hdr mode2", 1, 2, 1, 2, 2, 0 },
-+		{ "svc2/cmd3 hdr mode1", 2, 3, 1, 2, 1, 0 },
-+		{ "svc2/cmd3 hdr mode3", 2, 3, 1, 2, 3, 0 },
-+		{ "svc1/cmd2 plain", 1, 2, 0, 0, 1, 0 },
-+		{ "svc2/cmd3 plain", 2, 3, 0, 0, 1, 0 },
++		/* Modern SMCCC packing (Linux qcom_scm): fast call, SIP owner,
++		 * svc 1 cmd 0x10 = set download mode, args (0x10, enable). */
++		{ "smccc64 dload 10,10", 0xc2000110ull, 2, 0x10, 0x10 },
++		{ "smccc32 dload 10,10", 0x82000110ull, 2, 0x10, 0x10 },
++		{ "smccc64 dload 1,1", 0xc2000110ull, 2, 1, 1 },
++		{ "smccc32 dload 1,1", 0x82000110ull, 2, 1, 1 },
++		/* Legacy packing: x0 = (svc << 8) | cmd, x1 = (nargs << 24) | 1. */
++		{ "legacy svc1/cmd2", 0x102ull, 0x02000001ull, 1, 0 },
++		{ "legacy svc2/cmd3", 0x203ull, 0x02000001ull, 1, 0 },
 +	};
 +	uint64_t r[4];
 +	int accepted = 0;
@@ -169,13 +169,10 @@
 +	printf("SWEET EDL: %u good flushes, asking SCM for download mode\n",
 +	    (unsigned)os_atomic_load(&sweet_edl_flushes, relaxed));
 +	for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
-+		uint64_t fn = ((uint64_t)tries[i].svc << 8) | tries[i].cmd;
-+		uint64_t x1 = tries[i].header ?
-+		    (((uint64_t)tries[i].nargs << 24) | 1) : tries[i].arg0;
-+		uint64_t x2 = tries[i].header ? tries[i].arg0 : tries[i].arg1;
-+		sweet_smc(fn, x1, x2, 0, r);
-+		printf("SWEET EDL: SCM %s fn 0x%llx -> %llx %llx %llx %llx\n",
-+		    tries[i].name, (unsigned long long)fn,
++		sweet_smc(tries[i].x0, tries[i].x1, tries[i].x2, tries[i].x3, r);
++		printf("SWEET EDL: SCM %s x0 0x%llx -> %llx %llx %llx %llx
++",
++		    tries[i].name, (unsigned long long)tries[i].x0,
 +		    (unsigned long long)r[0], (unsigned long long)r[1],
 +		    (unsigned long long)r[2], (unsigned long long)r[3]);
 +		if ((int64_t)r[0] >= 0) {
@@ -216,7 +213,7 @@
  /* Sampling thread: driven by an absolute deadline, which does work in this
   * port (the tick based sleeps never expire). Samples first and sleeps after,
   * so a dump lands even if the wait never returns. Started from the first exec
-@@ -1062,6 +1250,26 @@
+@@ -1062,6 +1247,26 @@
  		sweet_dump_file();
  	}
  	sweet_log_flush_to_disk();
