@@ -1,0 +1,50 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -682,8 +682,9 @@
+ 
+ static int sweet_log_flush_to_disk(void);
+ static int sweet_sample_chan;
+ static int sweet_sample_started;
++static uint64_t sweet_sample_t0;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
+@@ -1033,12 +1034,23 @@
+ 			/* Indefinite sleep woken by the log path: deadline and tick based
+ 			 * sleeps never expire in this port. */
+ 			(void)tsleep(&sweet_sample_chan, PZERO, "sweetsmp", 0);
+ 		}
+-		printf("SWEET SMP: sample round %d\n", i);
+-		{
+-			extern void sweet_sample_now(void);
+-			sweet_sample_now();
++		uint64_t age = 0;
++		if (sweet_sample_t0 != 0) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - sweet_sample_t0, &age);
++		}
++		if (age < 60ULL * NSEC_PER_SEC) {
++			/* Too early: walking the process list while launchd is still
++			 * exec'ing deadlocks against the exec locks. */
++			printf("SWEET SMP: round %d skipped (age %llu ms)\n", i,
++			    (unsigned long long)(age / NSEC_PER_MSEC));
++		} else {
++			printf("SWEET SMP: sample round %d\n", i);
++			{
++				extern void sweet_sample_now(void);
++				sweet_sample_now();
++			}
+ 		}
+ 	}
+ }
+ 
+@@ -1050,8 +1062,9 @@
+ 	if (sweet_sample_started) {
+ 		return;
+ 	}
+ 	sweet_sample_started = 1;
++	sweet_sample_t0 = mach_absolute_time();
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
