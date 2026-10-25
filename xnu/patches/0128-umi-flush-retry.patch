@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -679,9 +679,9 @@
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+-static void sweet_log_flush_to_disk(void);
++static int sweet_log_flush_to_disk(void);
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
+@@ -713,9 +713,17 @@
+ 			step = kb * 1024u;
+ 		}
+ 		if (at - nf >= step &&
+ 		    os_atomic_cmpxchg(&next_flush, nf, at, relaxed)) {
+-			sweet_log_flush_to_disk();
++			if (sweet_log_flush_to_disk() != 0) {
++				/*
++				 * The write did not happen (the block lock was busy with HFS+
++				 * or the transfer failed). Put the budget back so the very next
++				 * console write retries: this is what made the log freeze at
++				 * ~40 KB, because every skipped attempt silently consumed it.
++				 */
++				os_atomic_store(&next_flush, nf, relaxed);
++			}
+ 		}
+ 	}
+ }
+ 
+@@ -927,20 +935,20 @@
+ 	sweet_in_panic = 1;
+ 	sweet_log_flush_to_disk();
+ }
+ 
+-static void
++static int
+ sweet_log_flush_to_disk(void)
+ {
+ 	uint64_t base, total, flushed, pos;
+ 	void *bounce;
+ 	int error = 0;
+ 
+ 	if (!su.writable || su.nblocks <= SWEET_LOG_BLOCKS) {
+-		return;
++		return 1;
+ 	}
+ 	if (!os_atomic_cmpxchg(&sweet_log_flushing, 0, 1, relaxed)) {
+-		return;
++		return 1;
+ 	}
+ 	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	bounce = (void *)(su.dma + DMA_BOUNCE);
+ 	total = os_atomic_load(&sweet_log_total, relaxed);
+@@ -993,8 +1001,9 @@
+ 			sweet_log_flushed = total;
+ 		}
+ 	}
+ 	os_atomic_store(&sweet_log_flushing, 0, relaxed);
++	return error ? 1 : 0;
+ }
+ 
+ static void
+ sweet_log_start(void)
