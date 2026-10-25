@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -188,9 +188,14 @@
+ 	PE_current_console(&video);
+ 	if (video.v_baseAddr == 0 || video.v_rowBytes == 0 || video.v_height == 0) {
+ 		return;
+ 	}
+-	vm_size_t size = (vm_size_t)video.v_rowBytes * video.v_height;
++	/*
++	 * Map only the rows the bar lives in. Mapping the whole panel needs about
++	 * 10 MB of kernel map and the kernel then fails a later kmem_alloc
++	 * (observed: panic in vm_kern.c at the first exec), so keep it tiny.
++	 */
++	vm_size_t size = (vm_size_t)video.v_rowBytes * 16;
+ 	vm_offset_t va = ml_io_map((vm_offset_t)video.v_baseAddr, size);
+ 	if (va == 0) {
+ 		return;
+ 	}
