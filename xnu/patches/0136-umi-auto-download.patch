@@ -74,7 +74,7 @@
  			}
  		}
  	}
-@@ -1005,6 +1058,138 @@
+@@ -1005,6 +1058,140 @@
  	return error ? 1 : 0;
  }
  
@@ -175,7 +175,9 @@
 +		    tries[i].name, (unsigned long long)tries[i].x0,
 +		    (unsigned long long)r[0], (unsigned long long)r[1],
 +		    (unsigned long long)r[2], (unsigned long long)r[3]);
-+		if ((int64_t)r[0] >= 0) {
++		/* SMCCC success is exactly 0; error codes are 32-bit values that
++		 * may or may not be sign extended, so do not test the sign. */
++		if (r[0] == 0) {
 +			accepted = 1;
 +		}
 +	}
@@ -213,7 +215,7 @@
  /* Sampling thread: driven by an absolute deadline, which does work in this
   * port (the tick based sleeps never expire). Samples first and sleeps after,
   * so a dump lands even if the wait never returns. Started from the first exec
-@@ -1062,6 +1247,24 @@
+@@ -1062,6 +1249,24 @@
  		sweet_dump_file();
  	}
  	sweet_log_flush_to_disk();
