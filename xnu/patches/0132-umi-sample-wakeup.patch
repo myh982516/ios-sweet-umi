@@ -1,0 +1,75 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -680,8 +680,10 @@
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ static int sweet_log_flush_to_disk(void);
++static int sweet_sample_chan;
++static int sweet_sample_started;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
+@@ -721,8 +723,14 @@
+ 				 * console write retries: this is what made the log freeze at
+ 				 * ~40 KB, because every skipped attempt silently consumed it.
+ 				 */
+ 				os_atomic_store(&next_flush, nf, relaxed);
++			} else if (sweet_sample_started) {
++				/* The one periodic hook that runs here drives the sampler. */
++				static uint32_t ok_writes;
++				if ((++ok_writes % 100) == 0) {
++					wakeup(&sweet_sample_chan);
++				}
+ 			}
+ 		}
+ 	}
+ }
+@@ -1008,36 +1016,34 @@
+ /* Sampling thread: driven by an absolute deadline, which does work in this
+  * port (the tick based sleeps never expire). Samples first and sleeps after,
+  * so a dump lands even if the wait never returns. Started from the first exec
+  * (kern_exec.c): before that there is no userspace to sample. */
+-static int sweet_sample_chan;
+-
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	for (int i = 0; i < 20; i++) {
++	for (int i = 0; i < 200; i++) {
++		if (i != 0) {
++			/* Indefinite sleep woken by the log path: deadline and tick based
++			 * sleeps never expire in this port. */
++			(void)tsleep(&sweet_sample_chan, PZERO, "sweetsmp", 0);
++		}
+ 		printf("SWEET SMP: sample round %d\n", i);
+ 		{
+ 			extern void sweet_sample_now(void);
+ 			sweet_sample_now();
+ 		}
+-		uint64_t deadline;
+-		clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
+-		assert_wait_deadline(&sweet_sample_chan, THREAD_UNINT, deadline);
+-		thread_block(THREAD_CONTINUE_NULL);
+ 	}
+ }
+ 
+ void
+ sweet_sample_kick(void)
+ {
+-	static int started;
+ 	thread_t thread;
+ 
+-	if (started) {
+-		return;
+-	}
+-	started = 1;
++	if (sweet_sample_started) {
++		return;
++	}
++	sweet_sample_started = 1;
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
