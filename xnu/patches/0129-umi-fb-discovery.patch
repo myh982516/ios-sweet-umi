@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2610,6 +2610,9 @@
+ static char sweet_iolog_names[128];
+ static int sweet_iolog_parsed;
+ static uint32_t sweet_iolog_lines;
++static uint32_t sweet_iolog_max = 400;
++static int sweet_iolog_all;
++static int sweet_iolog_capped;
+ 
+ static bool
+ sweet_iolog(char *name, size_t len)
+@@ -2618,12 +2621,32 @@
+ 		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
+ 			strlcpy(sweet_iolog_names, "backboardd,SpringBoard", sizeof(sweet_iolog_names));
+ 		}
++		/* sweetiologmax=N: 400 lines by default, 0 = unlimited.
++		 * sweetiologall=1: trace every process, not only the names above.
++		 * Both default off, so a boot without the boot-args logs as before. */
++		int maxlines = 0;
++		if (PE_parse_boot_argn("sweetiologmax", &maxlines, sizeof(maxlines)) && maxlines >= 0) {
++			sweet_iolog_max = (maxlines == 0) ? 0xffffffffu : (uint32_t)maxlines;
++		}
++		int all = 0;
++		if (PE_parse_boot_argn("sweetiologall", &all, sizeof(all))) {
++			sweet_iolog_all = all != 0;
++		}
+ 		sweet_iolog_parsed = 1;
+ 	}
+-	if (sweet_iolog_lines >= 400) {
++	if (sweet_iolog_lines >= sweet_iolog_max) {
++		if (!sweet_iolog_capped) {
++			sweet_iolog_capped = 1;
++			IOLog("IOK: trace limit %u reached (sweetiologmax=0 for no limit)\n",
++			    sweet_iolog_max);
++		}
+ 		return false;
+ 	}
+ 	proc_selfname(name, (int)len);
++	if (sweet_iolog_all) {
++		sweet_iolog_lines++;
++		return true;
++	}
+ 	size_t n = strlen(name);
+ 	for (const char *t = sweet_iolog_names; *t;) {
+ 		const char *end = strchr(t, ',');
+@@ -2778,8 +2801,14 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 		char sname[32];
+ 		if (sweet_iolog(sname, sizeof(sname))) {
+-			sweet_iolog_dict(sname, "matching1", dict,
+-			    *service ? (*service)->getMetaClass()->getClassName() : "none");
++			char found[64] = "none";
++			IOService *svc = OSDynamicCast(IOService, *service);
++			if (svc != NULL) {
++				snprintf(found, sizeof(found), "%s [%s]",
++				    svc->getName() ? svc->getName() : "?",
++				    svc->getMetaClass()->getClassName());
++			}
++			sweet_iolog_dict(sname, "matching1", dict, found);
+ 		}
+ #endif
+ 	} else {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -118,6 +118,8 @@
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -203,10 +205,64 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * sweetfb_props=1: also answer lookups that are not class based. iOS
++	 * userland occasionally asks for the graphics kext bundle id (or matches
++	 * on IOBundleIdentifier / IONameMatch through IOPropertyMatch); the
++	 * default boot sets none of these, so matching stays exactly as before.
++	 */
++	int props = 0;
++	PE_parse_boot_argn("sweetfb_props", &props, sizeof(props));
++	if (props) {
++		setProperty("IOBundleIdentifier", "com.apple.iokit.IOMobileGraphicsFamily");
++		setProperty("IOClass", "AppleCLCD");
++		setProperty("IOProviderClass", "IOPlatformDevice");
++		setProperty("IONameMatch", "sweet,display");
++		setProperty("compatible", "sweet,display");
++		IOLog("SWEET FB: props: IOBundleIdentifier=%s IOClass=AppleCLCD IONameMatch=sweet,display\n",
++		    "com.apple.iokit.IOMobileGraphicsFamily");
++	}
++	/*
++	 * sweetfb_dump=1: show where this service landed in the registry. Userspace
++	 * looks framebuffers up as IOService:/arm-io/... on Apple hardware; printing
++	 * the real path makes that difference visible in one boot.
++	 */
++	int dump = 0;
++	PE_parse_boot_argn("sweetfb_dump", &dump, sizeof(dump));
++	if (dump) {
++		char path[256];
++		int len = sizeof(path);
++		if (provider != NULL && provider->getPath(path, &len, gIOServicePlane)) {
++			IOLog("SWEET FB: provider path %s\n", path);
++		}
++		len = sizeof(path);
++		const IORegistryPlane *dt = IORegistryEntry::getPlane("IODeviceTree");
++		if (provider != NULL && dt != NULL && provider->getPath(path, &len, dt)) {
++			IOLog("SWEET FB: provider DT path %s\n", path);
++		}
++		len = sizeof(path);
++		if (getPath(path, &len, gIOServicePlane)) {
++			IOLog("SWEET FB: service path %s class %s\n", path,
++			    getMetaClass()->getClassName());
++		}
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
++}
++
++IOReturn
++AppleCLCD::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	IOReturn ret = IOService::newUserClient(owningTask, securityID, type, properties, handler);
++
++	/* IOServiceOpen always lands here first: a failure here means the client
++	 * class was not found/created, which never reaches IOMobileFramebufferUserClient::start. */
++	printf("SWEET FB: newUserClient type=%u -> 0x%x h=%p\n", type, ret,
++	    handler != NULL ? (void *)*handler : NULL);
++	return ret;
+ }
+ 
+ void
+@@ -419,6 +475,8 @@
+ {
+ 	fFB = OSDynamicCast(AppleCLCD, provider);
+ 	if (fFB == NULL || !IOUserClient::start(provider)) {
++		printf("SWEET FB: user client start failed task=%p fb=%p\n", (void *)fTask,
++		    (void *)fFB);
+ 		return false;
+ 	}
+ 	printf("SWEET FB: user client start task=%p\n", (void *)fTask);
+@@ -429,6 +487,7 @@
+ IOReturn
+ IOMobileFramebufferUserClient::clientClose(void)
+ {
++	printf("SWEET FB: user client close task=%p\n", (void *)fTask);
+ 	if (fFB != NULL) {
+ 		fFB->removeClient(this);
+ 		IOLockLock(fFB->fLock);
