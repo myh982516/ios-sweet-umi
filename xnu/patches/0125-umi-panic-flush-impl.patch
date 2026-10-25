@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -897,11 +897,26 @@
+ 
+ static uint64_t sweet_log_flushed;
+ static uint64_t sweet_log_seq;
+ static int sweet_log_flushing;
++static int sweet_in_panic;
+ 
+ /* Write the ring to the tail of the partition. Synchronous and re-entrancy
+  * protected; called from the console path every 8 KiB and once at start-up. */
++/*
++ * Called from panic() (twice: before and after the panic text is printed).
++ * Writes the ring once per call, without locks and without printing.
++ */
++void
++sweet_log_panic_flush(void)
++{
++	if (!su.ready || !su.writable || su.nblocks <= SWEET_LOG_BLOCKS) {
++		return;
++	}
++	sweet_in_panic = 1;
++	sweet_log_flush_to_disk();
++}
++
+ static void
+ sweet_log_flush_to_disk(void)
+ {
+ 	uint64_t base, total, flushed, pos;
+@@ -922,9 +937,15 @@
+ 		pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+ 		/* Never block here: this runs inside the console path, while the
+ 		 * driver may print (wanting the console lock) with this lock held.
+ 		 * Blocking would invert the order and deadlock. */
+-		if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++		/*
++		 * panic() has stopped the other CPUs, so nothing is left to serialise
++		 * against; taking a mutex there is illegal and can hang the panic path.
++		 */
++		if (sweet_in_panic) {
++			/* lock free */
++		} else if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
+ 			os_atomic_store(&sweet_log_flushing, 0, relaxed);
+ 			return;
+ 		}
+ 		while (pos < total && !error) {
+@@ -949,9 +970,11 @@
+ 		}
+ 		if (!error) {
+ 			error = ufs_sync_cache();
+ 		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!sweet_in_panic) {
++			lck_mtx_unlock(&sweet_ufs_lock);
++		}
+ 		/* No printing here: this runs with the console lock held (the flush is
+ 		 * triggered from the console output path), and a nested console write
+ 		 * would deadlock on the non-recursive lock. */
+ 		if (!error) {
