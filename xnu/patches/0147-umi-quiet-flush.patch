@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -715,9 +715,9 @@
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+-static uint32_t sweet_log_secs = 60;
++static uint32_t sweet_log_secs = 15;
+ static uint64_t sweet_smc(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t *, uint64_t *, uint64_t *);
+ static uint32_t sweet_edl_secs;
+ static uint32_t sweet_misc_secs;
+ static int64_t sweet_misc_start;
+@@ -1122,15 +1122,27 @@
+ 		}
+ 		/* A time stamp in the ring, so the persisted log shows how far the
+ 		 * kernel got and when it stopped. Appending here is safe: this is the
+ 		 * ring, not the console, and it takes no lock. */
++		static uint64_t last_seen;
++		uint64_t before = os_atomic_load(&sweet_log_total, relaxed);
+ 		char tick[64];
+ 		int n = snprintf(tick, sizeof(tick), "\nSWEET TICK %llu\n",
+ 		    (unsigned long long)mach_absolute_time());
+ 		if (n > 0) {
+ 			sweet_log_append(tick, n);
+ 		}
+-		sweet_log_flush_to_disk();
++		/*
++		 * Write the ring only when the console produced nothing at all in the
++		 * whole last period: during the boot storm the block driver is busy with
++		 * HFS+ page-ins, and a log write there is what froze the machine. Once
++		 * the system goes quiet (idle, or hung) this runs and preserves
++		 * everything up to that point, which is what a post-mortem needs.
++		 */
++		if (before == last_seen) {
++			sweet_log_flush_to_disk();
++		}
++		last_seen = os_atomic_load(&sweet_log_total, relaxed);
+ 		/*
+ 		 * Wake on output, and in any case after sweet_log_secs: an absolute
+ 		 * deadline does not depend on hz being initialised (it is not, at the
+ 		 * point where this thread is first started). The interval is a boot
