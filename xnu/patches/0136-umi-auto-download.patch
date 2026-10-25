@@ -83,10 +83,11 @@
 + * path): the SMC call below resets the SoC, so everything it prints is flushed
 + * to the persistent log first and read back over firehose after the reset.
 + *
-+ * Qualcomm SCM is entered as x0 = (svc << 8) | cmd, x1 = (nargs << 24) | 1,
-+ * then the arguments. The DLOAD service is svc 2 / cmd 3 in the older packing
-+ * and svc 1 / cmd 2 in the newer one (qcom_scm set_dload_mode); the argument
-+ * shape changed as well, so try the candidates and print every return value.
++ * The calls tried below are, in order: the SMCCC packing Linux uses
++ * (fast call, SIP owner, svc 1 cmd 0x10 = set download mode, args
++ * (0x10, enable)), and the older packing x0 = (svc << 8) | cmd with
++ * x1 = (nargs << 24) | 1. The argument shape moved between generations, so
++ * try the candidates and print every return value.
 + */
 +static void
 +sweet_smc(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t ret[4])
@@ -170,8 +171,7 @@
 +	    (unsigned)os_atomic_load(&sweet_edl_flushes, relaxed));
 +	for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
 +		sweet_smc(tries[i].x0, tries[i].x1, tries[i].x2, tries[i].x3, r);
-+		printf("SWEET EDL: SCM %s x0 0x%llx -> %llx %llx %llx %llx
-+",
++		printf("SWEET EDL: SCM %s x0 0x%llx -> %llx %llx %llx %llx\n",
 +		    tries[i].name, (unsigned long long)tries[i].x0,
 +		    (unsigned long long)r[0], (unsigned long long)r[1],
 +		    (unsigned long long)r[2], (unsigned long long)r[3]);
@@ -213,7 +213,7 @@
  /* Sampling thread: driven by an absolute deadline, which does work in this
   * port (the tick based sleeps never expire). Samples first and sleeps after,
   * so a dump lands even if the wait never returns. Started from the first exec
-@@ -1062,6 +1247,26 @@
+@@ -1062,6 +1247,24 @@
  		sweet_dump_file();
  	}
  	sweet_log_flush_to_disk();
@@ -228,12 +228,10 @@
 +			if (kernel_thread_start(sweet_edl_thread, NULL, &thread) ==
 +			    KERN_SUCCESS) {
 +				thread_deallocate(thread);
-+				printf("SWEET EDL: armed after %u good flushes
-+", after);
++				printf("SWEET EDL: armed after %u good flushes\n", after);
 +			} else {
 +				sweet_edl_after = 0;
-+				printf("SWEET EDL: thread start failed
-+");
++				printf("SWEET EDL: thread start failed\n");
 +			}
 +		}
 +	}
