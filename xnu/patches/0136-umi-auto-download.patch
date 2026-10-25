@@ -1,0 +1,245 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -282,6 +282,41 @@
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/*
++ * Raw block access to the whole LUN, ignoring the partition bounds. Only the
++ * automatic download-mode path uses this, to touch the bootloader message in
++ * "misc" (GPT offset 0x400000, i.e. block 1024 of this LUN).
++ */
++static int
++ufs_write_raw(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba + count - 1 > UINT32_MAX) {
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++static int
++ufs_read_raw(uint64_t lba, uint32_t count)
++{
++	if (count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba + count - 1 > UINT32_MAX) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x28, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -682,6 +717,18 @@
+ 
+ static int sweet_log_flush_to_disk(void);
+ 
++/*
++ * Automatic download-mode entry (boot-arg sweetedl_after=N). The console path
++ * may not print, allocate or block, so it only counts successful log flushes
++ * and wakes the thread below; a timer cannot be used here because the tick
++ * based sleeps never expire on this port.
++ */
++static int sweet_edl_chan;
++static uint32_t sweet_edl_after;               /* armed by boot-arg */
++static uint32_t _Atomic sweet_edl_flushes;     /* successful flush count */
++static void sweet_edl_thread(void *, wait_result_t);
++static void sweet_auto_download(void);
++
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
+@@ -722,6 +769,12 @@
+ 				 * the budget silently, which froze the log at about 40 KB.
+ 				 */
+ 				os_atomic_store(&next_flush, nf, relaxed);
++			} else if (sweet_edl_after != 0) {
++				/* One heartbeat per flushed block of console output. */
++				uint32_t n = os_atomic_add_orig(&sweet_edl_flushes, 1, relaxed) + 1;
++				if (n >= sweet_edl_after) {
++					wakeup(&sweet_edl_chan);
++				}
+ 			}
+ 		}
+ 	}
+@@ -1005,6 +1058,141 @@
+ 	return error ? 1 : 0;
+ }
+ 
++/*
++ * Automatic download mode. Called from a kernel thread (never from the console
++ * path): the SMC call below resets the SoC, so everything it prints is flushed
++ * to the persistent log first and read back over firehose after the reset.
++ *
++ * Qualcomm SCM is entered as x0 = (svc << 8) | cmd, x1 = (nargs << 24) | 1,
++ * then the arguments. The DLOAD service is svc 2 / cmd 3 in the older packing
++ * and svc 1 / cmd 2 in the newer one (qcom_scm set_dload_mode); the argument
++ * shape changed as well, so try the candidates and print every return value.
++ */
++static void
++sweet_smc(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t ret[4])
++{
++	register uint64_t x0 __asm__("x0") = a0;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	      "x14", "x15", "x16", "x17", "cc", "memory");
++	ret[0] = x0;
++	ret[1] = x1;
++	ret[2] = x2;
++	ret[3] = x3;
++}
++
++#define SWEET_MISC_BLOCK        1024u           /* 0x400000 / 4 KiB */
++#define SWEET_PS_SYSTEM_RESET   0x84000009ull
++
++/*
++ * Put an AOSP bootloader_message command into "misc": ABL reads it before it
++ * picks a boot target, which turns the next reset into fastboot without a key
++ * press. Written only if the field differs, and read back into the log.
++ */
++static void
++sweet_misc_command(const char *cmd)
++{
++	uint8_t *buf = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error;
++
++	if (!su.writable) {
++		printf("SWEET EDL: misc not writable, skipped\n");
++		return;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_raw(SWEET_MISC_BLOCK, 1);
++	if (error) {
++		printf("SWEET EDL: misc read -> %d\n", error);
++	} else {
++		printf("SWEET EDL: misc said '%.32s'\n", (const char *)buf);
++		if (memcmp(buf, cmd, strlen(cmd) + 1) != 0) {
++			bzero(buf, 32);
++			strlcpy((char *)buf, cmd, 32);
++			error = ufs_write_raw(SWEET_MISC_BLOCK, 1);
++			if (!error) {
++				error = ufs_sync_cache();
++			}
++			printf("SWEET EDL: misc <- '%s' -> %d\n", cmd, error);
++		} else {
++			printf("SWEET EDL: misc already set\n");
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++}
++
++static void
++sweet_auto_download(void)
++{
++	static const struct {
++		const char *name;
++		uint32_t svc, cmd;
++		int header;			/* x1 = (nargs << 24) | 1 */
++		uint32_t nargs;
++		uint64_t arg0, arg1;
++	} tries[] = {
++		{ "svc1/cmd2 hdr mode1", 1, 2, 1, 2, 1, 0 },
++		{ "svc1/cmd2 hdr mode2", 1, 2, 1, 2, 2, 0 },
++		{ "svc2/cmd3 hdr mode1", 2, 3, 1, 2, 1, 0 },
++		{ "svc2/cmd3 hdr mode3", 2, 3, 1, 2, 3, 0 },
++		{ "svc1/cmd2 plain", 1, 2, 0, 0, 1, 0 },
++		{ "svc2/cmd3 plain", 2, 3, 0, 0, 1, 0 },
++	};
++	uint64_t r[4];
++	int accepted = 0;
++
++	printf("SWEET EDL: %u good flushes, asking SCM for download mode\n",
++	    (unsigned)os_atomic_load(&sweet_edl_flushes, relaxed));
++	for (size_t i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
++		uint64_t fn = ((uint64_t)tries[i].svc << 8) | tries[i].cmd;
++		uint64_t x1 = tries[i].header ?
++		    (((uint64_t)tries[i].nargs << 24) | 1) : tries[i].arg0;
++		uint64_t x2 = tries[i].header ? tries[i].arg0 : tries[i].arg1;
++		sweet_smc(fn, x1, x2, 0, r);
++		printf("SWEET EDL: SCM %s fn 0x%llx -> %llx %llx %llx %llx\n",
++		    tries[i].name, (unsigned long long)fn,
++		    (unsigned long long)r[0], (unsigned long long)r[1],
++		    (unsigned long long)r[2], (unsigned long long)r[3]);
++		if ((int64_t)r[0] >= 0) {
++			accepted = 1;
++		}
++	}
++	if (!accepted) {
++		printf("SWEET EDL: SCM rejected all, using misc\n");
++		sweet_misc_command("boot-fastboot");
++	} else {
++		printf("SWEET EDL: SCM accepted a request\n");
++	}
++	/* The reset takes the console with it: persist these lines first. */
++	sweet_log_flush_to_disk();
++	printf("SWEET EDL: PSCI SYSTEM_RESET\n");
++	sweet_log_flush_to_disk();
++	sweet_smc(SWEET_PS_SYSTEM_RESET, 0, 0, 0, r);
++	printf("SWEET EDL: reset returned 0x%llx\n", (unsigned long long)r[0]);
++}
++
++/* One shot, woken by the console path's flush counter. */
++static void
++sweet_edl_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		/* Check before sleeping: a wakeup sent before the first sleep is not
++		 * queued, and the flush counter is already past the mark by then. */
++		if (sweet_edl_after != 0 &&
++		    os_atomic_load(&sweet_edl_flushes, relaxed) >= sweet_edl_after) {
++			sweet_edl_after = 0;	/* one shot */
++			sweet_auto_download();
++			continue;
++		}
++		(void)tsleep(&sweet_edl_chan, PZERO, "sweetedl", 0);
++	}
++}
++
+ /* Sampling thread: driven by an absolute deadline, which does work in this
+  * port (the tick based sleeps never expire). Samples first and sleeps after,
+  * so a dump lands even if the wait never returns. Started from the first exec
+@@ -1062,6 +1250,26 @@
+ 		sweet_dump_file();
+ 	}
+ 	sweet_log_flush_to_disk();
++	{
++		uint32_t after = 0;
++
++		if (PE_parse_boot_argn("sweetedl_after", &after, sizeof(after)) &&
++		    after > 0) {
++			thread_t thread;
++
++			sweet_edl_after = after;
++			if (kernel_thread_start(sweet_edl_thread, NULL, &thread) ==
++			    KERN_SUCCESS) {
++				thread_deallocate(thread);
++				printf("SWEET EDL: armed after %u good flushes
++", after);
++			} else {
++				sweet_edl_after = 0;
++				printf("SWEET EDL: thread start failed
++");
++			}
++		}
++	}
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
