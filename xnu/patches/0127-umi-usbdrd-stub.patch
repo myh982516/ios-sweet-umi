@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -71,8 +71,33 @@
+ 	if (armio != NULL) {
+ 		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+ 		armio->release();
+ 	}
++
++	/*
++	 * backboardd registers a notification for IONameMatch "usb-drd,t8027" and
++	 * keeps that path open while it brings the window server up. The device tree
++	 * has no USB node, so publish a stub with exactly that name: the
++	 * notification fires and backboardd is not left waiting on a service that
++	 * can never appear. It carries no registers, so no driver will claim it.
++	 */
++	{
++		int stub = 1;
++		PE_parse_boot_argn("sweetusbdrd", &stub, sizeof(stub));
++		if (stub) {
++			IOService *usb = OSTypeAlloc(IOService);
++			if (usb != NULL) {
++				if (usb->init() && usb->attach(IOService::getServiceRoot())) {
++					usb->setName("usb-drd,t8027");
++					usb->setProperty("compatible", "usb-drd,t8027");
++					usb->setProperty("IONameMatch", "usb-drd,t8027");
++					usb->registerService();
++					IOLog("SWEET: published stub usb-drd,t8027\n");
++				}
++				usb->release();
++			}
++		}
++	}
+ }
+ 
+ /*
+  * hw.target / hw.product come from IODTPlatformExpert: the first root
