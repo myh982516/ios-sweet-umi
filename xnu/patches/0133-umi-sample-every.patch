@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -721,9 +721,17 @@
+ 				os_atomic_store(&next_flush, nf, relaxed);
+ 			} else if (sweet_sample_started) {
+ 				/* The one periodic hook that runs here drives the sampler. */
+ 				static uint32_t ok_writes;
+-				if ((++ok_writes % 100) == 0) {
++				static uint32_t every;
++				if (every == 0) {
++					every = 20;
++					PE_parse_boot_argn("sweetsampleevery", &every, sizeof(every));
++					if (every < 1) {
++						every = 1;
++					}
++				}
++				if ((++ok_writes % every) == 0) {
+ 					wakeup(&sweet_sample_chan);
+ 				}
+ 			}
+ 		}
