@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -163,8 +163,89 @@
+@@ -163,8 +163,94 @@
  		    pname[p], kids_n, disp);
  	}
  }
@@ -9,10 +9,14 @@
 + * SWEET heartbeat on the panel itself: the persistent log needs UFS writes,
 + * and those are exactly what we suspect of hanging the boot. Drawing a bar
 + * needs nothing but a mapped framebuffer, so a photo of the screen tells how
-+ * many ticks the kernel survived.
++ * many ticks the kernel survived. The text console keeps drawing (it prints a
++ * SWEET TICK line every period); muting it made a live system look frozen, so
++ * it is only muted when the sweetfbmute boot argument asks for it.
 + */
 +static volatile uint32_t *sweet_hb_fb;
 +static uint32_t sweet_hb_row, sweet_hb_w, sweet_hb_h;
++static int sweet_hb_mute;
++static int sweet_hb_mute_parsed;
 +extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +/* osfmk/console/serial_console.c: non-zero stops drawing text on the panel
 + * (the ring log still gets every byte). */
@@ -23,6 +27,10 @@
 +{
 +	PE_Video video;
 +
++	if (!sweet_hb_mute_parsed) {
++		sweet_hb_mute_parsed = 1;
++		PE_parse_boot_argn("sweetfbmute", &sweet_hb_mute, sizeof(sweet_hb_mute));
++	}
 +	if (sweet_hb_fb != NULL) {
 +		return;
 +	}
@@ -44,12 +52,9 @@
 +	sweet_hb_h = (uint32_t)video.v_height;
 +	sweet_hb_row = (uint32_t)video.v_rowBytes / 4;
 +	sweet_hb_fb = (volatile uint32_t *)va;
-+	/*
-+	 * The text console paints the whole panel, including this bar, so stop it
-+	 * from drawing: otherwise the heartbeat is erased by the next printf and a
-+	 * frozen screen looks like a hung kernel with no blocks at all.
-+	 */
-+	sweet_console_muted = 1;
++	if (sweet_hb_mute) {
++		sweet_console_muted = 1;
++	}
 +	/* Opaque white corner marker: proof that the mapping and the format work,
 +	 * independent of the bar. */
 +	for (uint32_t y = 0; y < 24; y++) {
