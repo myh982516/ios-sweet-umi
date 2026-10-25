@@ -1,0 +1,26 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -698,10 +698,22 @@
+ 	/* Flush every 8 KiB of console output: timers and wakeups are not usable
+ 	 * this early, so the console path itself writes the ring. */
+ 	{
+ 		static uint64_t _Atomic next_flush;
++		static uint32_t step;
+ 		uint64_t nf = os_atomic_load(&next_flush, relaxed);
+-		if (at - nf >= 8192 &&
++		if (step == 0) {
++			uint32_t kb = 8;
++			PE_parse_boot_argn("sweetlogkb", &kb, sizeof(kb));
++			if (kb < 1) {
++				kb = 1;
++			}
++			if (kb > 1024) {
++				kb = 1024;
++			}
++			step = kb * 1024u;
++		}
++		if (at - nf >= step &&
+ 		    os_atomic_cmpxchg(&next_flush, nf, at, relaxed)) {
+ 			sweet_log_flush_to_disk();
+ 		}
+ 	}
