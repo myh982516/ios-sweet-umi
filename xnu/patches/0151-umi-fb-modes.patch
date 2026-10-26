@@ -1,0 +1,124 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -34,8 +34,12 @@
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+ #if defined(SWEET)
+@@ -80,8 +84,10 @@
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_TIMING_ID      1
++#define SWEET_FB_COLOR_ID       1
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -121,8 +127,9 @@
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void publishModes(void);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+@@ -147,8 +154,77 @@
+ 	void notify(uint32_t type, const uint64_t *values, uint32_t count);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
++
++static void
++sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++/*
++ * Publish the display's timing and colour elements. IOMobileFramebuffer.framework
++ * enumerates display modes through these two arrays; a service without them is a
++ * display it cannot configure, and CoreAnimation then never opens it. The layout
++ * follows the working umi bring-up (leafall903/ios-sweet-umi v6, APSL 2.0).
++ */
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = 60u << 16;        /* 16.16 */
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL &&
++	    timings != NULL && colors != NULL) {
++		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_set_number(color, "PixelEncoding", 0);
++		sweet_set_number(color, "Depth", 8);
++		sweet_set_number(color, "Colorimetry", 1);
++		sweet_set_number(color, "EOTF", 1);
++		sweet_set_number(color, "DynamicRange", 0);
++		sweet_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++
++		sweet_set_number(horizontal, "Active", fLogicalW);
++		sweet_set_number(horizontal, "Total", fLogicalW);
++		sweet_set_number(horizontal, "SyncRate", rate);
++		sweet_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_set_number(vertical, "Active", fLogicalH);
++		sweet_set_number(vertical, "Total", fLogicalH);
++		sweet_set_number(vertical, "SyncRate", rate);
++		sweet_set_number(vertical, "PreciseSyncRate", rate);
++
++		sweet_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
+ 
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -202,8 +278,9 @@
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	publishModes();
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
