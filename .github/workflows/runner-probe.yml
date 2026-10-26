@@ -1,0 +1,25 @@
+name: runner-probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/runner-probe.yml"
+
+concurrency:
+  group: probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: hello
+        run: |
+          echo "runner ${{ matrix.os }} is alive"
+          sw_vers
+          xcodebuild -version
