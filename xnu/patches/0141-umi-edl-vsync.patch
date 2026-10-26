@@ -9,7 +9,7 @@
 +	 * console goes quiet, so the automatic download deadline is tested here
 +	 * too (see sweet_edl_check in sweet_ufs.c). */
 +	{
-+		extern void sweet_edl_check(void);
++		extern "C" void sweet_edl_check(void);
 +		sweet_edl_check();
 +	}
  	uint64_t now = mach_absolute_time();
