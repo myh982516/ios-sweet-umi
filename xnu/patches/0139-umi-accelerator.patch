@@ -1,0 +1,67 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGK.cpp
+@@ -0,0 +1,43 @@
++/*
++ * The graphics accelerator.  There is no GPU driver in this tree, but
++ * CoreAnimation waits for a service of this class to appear before it looks
++ * for a GPU at all (once per process, for about half a minute).  An
++ * accelerator that does not carry the properties naming its Metal and
++ * OpenGL ES drivers is passed over by both, which leaves CoreAnimation with
++ * its software renderer: it then allocates IOSurfaces and asks the display
++ * for a framebuffer instead of giving up first.
++ *
++ * Method taken from HackiOS (xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp,
++ * APSL 2.0, same XNU lineage as this tree).
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSObject.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++void
++sweet_publish_accelerator(IOService *provider)
++{
++	IOAcceleratorES *accelerator;
++
++	if (provider == NULL) {
++		return;
++	}
++	accelerator = OSTypeAlloc(IOAcceleratorES);
++	if (accelerator == NULL || !accelerator->init() || !accelerator->attach(provider)) {
++		OSSafeReleaseNULL(accelerator);
++		IOLog("SWEET GK: cannot publish the accelerator\n");
++		return;
++	}
++	/* The name is what CoreAnimation matches on; on Apple hardware the GPU
++	 * driver's nub is called sgx. */
++	accelerator->setName("sgx");
++	accelerator->registerService();
++	IOLog("SWEET GK: IOAccelerator sgx published\n");
++	accelerator->release();
++}
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,3 +13,4 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetGK.cpp                                     optional iokitcpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -30,4 +30,11 @@
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++
++	/* CoreAnimation waits for an IOAccelerator before it looks at the GPU
++	 * or the display at all: publish the bare one (there is no GPU). */
++	{
++		extern void sweet_publish_accelerator(IOService *provider);
++		sweet_publish_accelerator(this);
++	}
+ 	return true;
+ }
