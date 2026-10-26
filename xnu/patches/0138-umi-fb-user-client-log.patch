@@ -1,0 +1,21 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1300,15 +1300,18 @@
+ bool
+ IOMobileFramebufferUserClient::start(IOService *provider)
+ {
+ 	fFB = OSDynamicCast(AppleCLCD, provider);
+ 	if (fFB == NULL || !IOUserClient::start(provider)) {
++		IOLog("SWEET FB: user client refused provider %s\n",
++		    provider != NULL ? provider->getMetaClass()->getClassName() : "null");
+ 		return false;
+ 	}
+ 	fFB->addClient(this);
++	IOLog("SWEET FB: user client start task=%p\n", (void *)fTask);
+ 	return true;
+ }
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::clientClose(void)
+ {
+ 	if (fFB != NULL) {
