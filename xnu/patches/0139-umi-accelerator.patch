@@ -46,10 +46,10 @@
 +}
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -13,3 +13,4 @@
- iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
- iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
- iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+@@ -20,3 +20,4 @@
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
 +iokit/Kernel/arm/SweetGK.cpp                                     optional iokitcpp
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
