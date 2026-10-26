@@ -1,39 +1,10 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -385,15 +385,45 @@
+@@ -385,17 +385,18 @@
  };
  
  OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOService);
  
-+/*
-+ * Create and publish the IOSurface root. Nothing else in this kernel does it,
-+ * and CoreAnimation asks for IOSurfaceRoot before it ever looks at the display,
-+ * so without this the window server gives up early and no framebuffer user
-+ * client is ever opened.
-+ */
-+void
-+sweet_surface_start(IOService *provider)
-+{
-+	IOCoreSurfaceRoot *root;
-+
-+	if (provider == NULL) {
-+		return;
-+	}
-+	root = OSTypeAlloc(IOCoreSurfaceRoot);
-+	if (root == NULL || !root->init() || !root->attach(provider)) {
-+		OSSafeReleaseNULL(root);
-+		IOLog("SWEET SURF: cannot create the root service\n");
-+		return;
-+	}
-+	if (!root->start(provider)) {
-+		root->detach(provider);
-+		IOLog("SWEET SURF: the root service did not start\n");
-+	} else {
-+		IOLog("SWEET SURF: IOSurfaceRoot published\n");
-+	}
-+	root->release();
-+}
-+
  bool
  IOCoreSurfaceRoot::start(IOService *provider)
  {
@@ -41,26 +12,10 @@
  	if (!IOService::start(provider)) {
  		return false;
  	}
-+	IOLog("SWEET SURF: root start entered\n");
  	sweet_surface_init_lock();
  	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
  	registerService();
  	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
---- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
-+++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -30,8 +30,15 @@
- 		return false;
- 	}
- 	registerService();
- 	IOLog("SWEET: platform expert registered\n");
-+
-+	/* The stock IOSurface kext does this on Apple hardware; publish the root
-+	 * here so CoreAnimation can allocate surfaces before it touches the display. */
-+	{
-+		extern void sweet_surface_start(IOService *provider);
-+		sweet_surface_start(this);
-+	}
++	IOLog("SWEET SURF: IOSurfaceRoot published\n");
  	return true;
  }
- 
- const char *
