@@ -1,0 +1,17 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -213,6 +213,14 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++
++	/* The panel timer is the only periodic path that keeps running when the
++	 * console goes quiet, so the automatic download deadline is tested here
++	 * too (see sweet_edl_check in sweet_ufs.c). */
++	{
++		extern void sweet_edl_check(void);
++		sweet_edl_check();
++	}
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
