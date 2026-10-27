@@ -6,8 +6,8 @@
  			sweet_vtimer_intid = intid;
  		}
 +		/*
-+		 * The device tree names the timer PPI, but a wrong value there leaves the
-+		 * timer interrupt unmatched and every timer in the kernel dead (tsleep,
++		 * The device tree names the timer PPI; a wrong value leaves the timer
++		 * interrupt unmatched and every timer in the kernel dead (tsleep,
 +		 * deadlines, IOTimerEventSource). Allow an override so the right PPI can
 +		 * be found without rebuilding the device tree.
 +		 */
@@ -24,25 +24,39 @@
  		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1871,8 +1871,17 @@
+@@ -130,8 +130,11 @@
+ 
+ 
+ 
+ void sleh_irq(arm_saved_state_t *);
++
++/* SWEET: how many timer interrupts the kernel has taken (diagnostics). */
++uint32_t sweet_timer_tick_count;
+ void sleh_fiq(arm_saved_state_t *);
+ void sleh_serror(arm_context_t *context, uint32_t esr, vm_offset_t far);
+ void sleh_invalid_stack(arm_context_t *context, uint32_t esr, vm_offset_t far) __dead2;
+ 
+@@ -1871,8 +1874,19 @@
  	if (intid >= 1020 && intid <= 1023) {
  		return; /* spurious */
  	}
  	if (intid == sweet_vtimer_intid) {
-+		/* Proof that the timer actually fires: the first few ticks. */
-+		{
-+			static uint32_t sweet_timer_ticks;
-+			if (sweet_timer_ticks < 3) {
-+				kprintf("SWEET TMR: tick %u intid=%u\n",
-+				    (unsigned)sweet_timer_ticks, (unsigned)intid);
-+			}
-+			sweet_timer_ticks++;
++		/*
++		 * Proof that the timer fires. The first ticks print before the log ring
++		 * exists, so keep counting and print every 1024th one: those land in the
++		 * persistent log.
++		 */
++		sweet_timer_tick_count++;
++		if (sweet_timer_tick_count <= 3 ||
++		    (sweet_timer_tick_count & 1023) == 0) {
++			kprintf("SWEET TMR: tick %u intid=%u\n",
++			    (unsigned)sweet_timer_tick_count, (unsigned)intid);
 +		}
  		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
  		cdp->cpu_decrementer = -1; /* Large */
  		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
  		rtclock_intr(TRUE);
-@@ -1895,8 +1904,19 @@
+@@ -1895,8 +1909,19 @@
  			    cpu_number(), sweet_cpu_signal_raw(cpu_number()),
  			    __builtin_arm_rsr64("DAIF"));
  		}
@@ -62,3 +76,22 @@
  		if (cdp->interrupt_handler) {
  			cdp->interrupt_handler(cdp->interrupt_target,
  			    cdp->interrupt_refCon,
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -279,8 +279,16 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	publishModes();
++	{
++		/* Late enough to be in the persistent log: what the kernel thinks the
++		 * timer interrupt is, and whether it has ever fired. */
++		extern uint32_t sweet_vtimer_intid;
++		extern uint32_t sweet_timer_tick_count;
++		IOLog("SWEET TMR: vtimer intid=%u ticks=%u at framebuffer start\n",
++		    (unsigned)sweet_vtimer_intid, (unsigned)sweet_timer_tick_count);
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
