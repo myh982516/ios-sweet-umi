@@ -1,29 +1,51 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -41,8 +41,13 @@
+@@ -41,8 +41,14 @@
  #include <libkern/c++/OSBoolean.h>
  
  extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  
-+/* Defined in bsd/dev/sweet_ufs.c (C): the automatic download deadline.
-+ * The declaration has to live at file scope, an extern "C" one inside
-+ * a function body is ill-formed in C++. */
++/* Defined in C files: the automatic download deadline (bsd/dev/sweet_ufs.c) and
++ * the user stack sampler (bsd/dev/sweet_sample.c). Both have to be declared at
++ * file scope: an extern "C" declaration inside a function body is ill-formed. */
 +extern "C" void sweet_edl_check(void);
++extern "C" void sweet_sample_now(void);
 +
  #if defined(SWEET)
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
-@@ -289,8 +294,13 @@
+@@ -289,8 +295,34 @@
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
 +
-+	/* The panel timer is the only periodic path that keeps running when the
-+	 * console goes quiet, so the automatic download deadline is tested here
-+	 * too (see sweet_edl_check in sweet_ufs.c). */
++	/*
++	 * The panel timer keeps running when the console goes quiet, which is
++	 * exactly when the interesting stalls happen: check the automatic download
++	 * deadline here, and once, a minute in, dump the user stacks of the
++	 * processes that are supposed to be bringing the display up.
++	 */
 +	sweet_edl_check();
++	{
++		static bool sampled;
++		static uint64_t t0;
++
++		if (!sampled) {
++			uint64_t age = 0;
++
++			if (t0 == 0) {
++				t0 = mach_absolute_time();
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &age);
++			if (age > 60ULL * NSEC_PER_SEC) {
++				sampled = true;
++				printf("SWEET SMP: sampling the display processes\n");
++				sweet_sample_now();
++			}
++		}
++	}
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
