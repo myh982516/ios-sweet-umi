@@ -1,0 +1,27 @@
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -189,9 +189,23 @@
+ 	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+-	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	/*
++	 * SWEET: besides the timer INTID the device tree gives us, enable every
++	 * generic-timer PPI candidate (26..31). sleh_irq logs any unexpected PPI it
++	 * receives, so one boot tells us which interrupt the hardware really uses
++	 * instead of guessing one value per build.
++	 */
++	{
++		uint32_t mask = (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI);
++		if (sweet_vtimer_intid < 26 || sweet_vtimer_intid > 31) {
++			for (uint32_t ppi = 26; ppi <= 31; ppi++) {
++				mask |= 1U << ppi;
++			}
++		}
++		gicr_write32(GICR_ISENABLER0, mask);
++	}
+ 	kprintf("SWEET SMP: pe_init_fiq mpidr=0x%llx enabled SGI%u vtimer%u isen=0x%x igrpen1=0x%llx\n",
+ 	    __builtin_arm_rsr64("MPIDR_EL1") & 0xFFFFFFULL, SWEET_IPI_SGI,
+ 	    sweet_vtimer_intid, gicr_read32(GICR_ISENABLER0),
+ 	    __builtin_arm_rsr64("ICC_IGRPEN1_EL1"));
