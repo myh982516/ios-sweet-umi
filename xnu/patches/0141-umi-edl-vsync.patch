@@ -1,6 +1,21 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -213,6 +213,14 @@
+@@ -41,8 +41,13 @@
+ #include <libkern/c++/OSBoolean.h>
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
++/* Defined in bsd/dev/sweet_ufs.c (C): the automatic download deadline.
++ * The declaration has to live at file scope, an extern "C" one inside
++ * a function body is ill-formed in C++. */
++extern "C" void sweet_edl_check(void);
++
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+@@ -289,8 +294,13 @@
+ void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -8,10 +23,8 @@
 +	/* The panel timer is the only periodic path that keeps running when the
 +	 * console goes quiet, so the automatic download deadline is tested here
 +	 * too (see sweet_edl_check in sweet_ufs.c). */
-+	{
-+		extern "C" void sweet_edl_check(void);
-+		sweet_edl_check();
-+	}
++	sweet_edl_check();
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
  	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
