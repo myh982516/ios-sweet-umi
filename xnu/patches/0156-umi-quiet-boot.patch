@@ -1,0 +1,36 @@
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -6484,10 +6484,8 @@
+ {
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	assert(parameter == NULL);
+ 
+-	kprintf("SWEET SMP: cpu=%u idle_thread enter DAIF=0x%llx signal=0x%x\n",
+-	    cpu_number(), __builtin_arm_rsr64("DAIF"), getCpuDatap()->cpu_signal);
+ 
+ 	processor_t processor = current_processor();
+ 
+ 	/*
+@@ -6500,10 +6498,8 @@
+ 	 * Enable interrupts temporarily to handle any pending interrupts
+ 	 * or IPIs before deciding to sleep
+ 	 */
+ 	spllo();
+-	kprintf("SWEET SMP: cpu=%u idle_thread after spllo DAIF=0x%llx signal=0x%x\n",
+-	    cpu_number(), __builtin_arm_rsr64("DAIF"), getCpuDatap()->cpu_signal);
+ 
+ 	thread_t new_thread = processor_idle(THREAD_NULL, processor);
+ 	/* returns with interrupts disabled */
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1871,7 +1871,7 @@
+ 	if (intid == sweet_vtimer_intid) {
+ 		sweet_timer_tick_count++;
+-		if (sweet_timer_tick_count <= 3 || (sweet_timer_tick_count & 1023) == 0) {
++		if (sweet_timer_tick_count <= 3) {
+ 			kprintf("SWEET TMR: tick %u intid=%u\n",
+ 			    (unsigned)sweet_timer_tick_count, (unsigned)intid);
+ 		}
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
