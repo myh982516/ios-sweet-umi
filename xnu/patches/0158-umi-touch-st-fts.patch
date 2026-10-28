@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/umi_touch.c
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,954 @@
 +/*
 + * Xiaomi Mi 10 (umi, SM8250): STMicroelectronics FingerTipS touch screen.
 + *
@@ -837,11 +837,20 @@
 +		(void)PE_parse_boot_argn("umi_touch_supply", &supply, sizeof(supply));
 +		if (supply) {
 +			extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
-+			int e = sweet_rpmh_vreg_enable("ldoc1", 1800);
++			static const char *const rails[] = { "smpa4", "smpa5", "ldoc1" };
 +
-+			printf("UMI TOUCH: ldoc1 (1.8 V, the bus pull-ups) -> %d\n", e);
-+			umi_spin_ms(10);
-+			show_pins("after ldoc1");
++			/*
++			 * In the order the hardware wants them: the core rails first (a part
++			 * whose core is dark acknowledges nothing and reads zero for every
++			 * register), then the 1.8 V the pair's pull-ups hang from.
++			 */
++			for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++				int e = sweet_rpmh_vreg_enable(rails[i], 1800);
++
++				printf("UMI TOUCH: %s -> %d\n", rails[i], e);
++				umi_spin_ms(10);
++			}
++			show_pins("rails on");
 +		}
 +	}
 +
@@ -981,7 +990,7 @@
   * Persistent console log ("sweetlog"). Filming the phone screen is the only
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -326,11 +326,28 @@
+@@ -326,11 +326,43 @@
  
  int
  sweet_rpmh_vreg_enable(const char *res, unsigned mv)
@@ -990,25 +999,40 @@
 -	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
 -		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
 +	/*
-+	 * Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
-+	 * resources. ldoc11 is the sweet panel rail; ldoc1 is the 1.8 V the umi
-+	 * touch bus pull-ups hang from (umi_touch_supply=1 asks for it).
++	 * Board-specific helper: do not apply one PMIC policy to arbitrary
++	 * resources. Allowed, with the voltages each rail is asked for:
++	 *   ldoc11  2950..3400 mV   the sweet panel rail
++	 *   ldoc1   1700..1900 mV   the umi touch bus pull-ups (1.8 V)
++	 *   smpa4   1700..1900 mV   umi touch core, first avdd variant
++	 *   smpa5   1700..1900 mV   umi touch core, second avdd variant
 +	 */
++	static const struct {
++		const char *name;
++		unsigned lo, hi;
++	} rails[] = {
++		{ "ldoc11", 2950, 3400 },
++		{ "ldoc1",  1700, 1900 },
++		{ "smpa4",  1700, 1900 },
++		{ "smpa5",  1700, 1900 },
++	};
++	unsigned lo = 0, hi = 0;
++
 +	if (!res) {
 +		return EINVAL;
 +	}
-+	if (strcmp(res, "ldoc11") == 0) {
-+		if (mv < 2950 || mv > 3400) {
-+			printf("SWEET RPMH: ldoc11 wants 2950..3400 mV\n");
-+			return EINVAL;
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		if (strcmp(res, rails[i].name) == 0) {
++			lo = rails[i].lo;
++			hi = rails[i].hi;
++			break;
 +		}
-+	} else if (strcmp(res, "ldoc1") == 0) {
-+		if (mv < 1700 || mv > 1900) {
-+			printf("SWEET RPMH: ldoc1 wants 1700..1900 mV\n");
-+			return EINVAL;
-+		}
-+	} else {
++	}
++	if (lo == 0) {
 +		printf("SWEET RPMH: unsupported rail %s\n", res);
++		return EINVAL;
++	}
++	if (mv < lo || mv > hi) {
++		printf("SWEET RPMH: %s wants %u..%u mV\n", res, lo, hi);
  		return EINVAL;
  	}
  	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
