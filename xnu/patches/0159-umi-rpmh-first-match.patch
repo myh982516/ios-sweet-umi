@@ -1,0 +1,35 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -190,18 +190,29 @@
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+ 				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
+ 				return EINVAL;
+ 			}
+-			*address = addr;
++			/*
++			 * cmd-db can list the same rail more than once (smpa4 and smpa5
++			 * both do on this phone, the second entry being the other
++			 * regulator access path). The vendor lookup takes the first one,
++			 * so do the same instead of refusing the rail.
++			 */
++			if (matches == 0) {
++				*address = addr;
++			}
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+-	if (matches != 1) {
+-		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
++	if (matches == 0) {
++		printf("SWEET RPMH: %s is not in cmd-db\n", res);
+ 		return ENODEV;
++	}
++	if (matches > 1) {
++		printf("SWEET RPMH: %s has %u cmd-db entries; using the first\n", res, matches);
+ 	}
+ 	return 0;
+ }
+ 
