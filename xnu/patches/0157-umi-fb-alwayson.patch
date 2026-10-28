@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -623,8 +623,20 @@
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			/*
++			 * sweetfb_alwayson=1: never blank the panel. The port has no touch
++			 * or power-key input yet, so an auto-lock would leave the screen dark
++			 * with no way to wake it, hiding the fact that the display works.
++			 */
++			{
++				int always_on = 0;
++				if (PE_parse_boot_argn("sweetfb_alwayson", &always_on, sizeof(always_on)) &&
++				    always_on != 0) {
++					off = false;
++				}
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
