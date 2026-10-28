@@ -1,0 +1,962 @@
+--- /dev/null
++++ b/bsd/dev/umi_touch.c
+@@ -0,0 +1,926 @@
++/*
++ * Xiaomi Mi 10 (umi, SM8250): STMicroelectronics FingerTipS touch screen.
++ *
++ * Ported from ls9875/hackios-umi's xnu/files/bsd/dev/umi_touch.c, which drove
++ * this part into /dev/redwood-touch (sys/redwood_input.h) on the redwood port.
++ * Only what is needed here is kept: the hand-driven I2C on gpio36/gpio37, the
++ * FingerTipS register and event protocol, and the reporting loop. The devfs
++ * node, redwood_input.h and the hakios/RPMh power helpers are gone; events go
++ * to sweet_hid_touch(), the same entry bsd/dev/sweet_touch.c posts to and
++ * iokit/Kernel/arm/hid/SweetHID.cpp consumes.
++ *
++ * The hardware numbers, taken from umi.dtb and the dtbo overlays the loader
++ * applies (overlay-17.dtbo entry 2, compatible "st,fts"; Xiaomi's
++ * drivers/input/touchscreen/st/ in umi-q-oss is the protocol reference):
++ *
++ *   bus      qupv3_se13_i2c = soc/i2c@a94000, fts@49 -> address 0x49.
++ *            The GENI engine's I2C firmware is loaded by whoever configures
++ *            engine 13 for I2C and nothing on this boot path does, so the
++ *            engine is not used at all: gpio36/gpio37 are muxed from "qup13"
++ *            to plain GPIOs and I2C is driven by hand.
++ *   pins     gpio36 = SDA, gpio37 = SCL (which is which was never written
++ *            down; umi_touch_pinswap=1 tries the other way round).
++ *            gpio38 = reset, active low (a low pulse resets the part).
++ *            gpio39 = interrupt, low = an event is waiting in the FIFO.
++ *   power    touch_vddio_vreg ("disp_vddio_vreg"), enable gpio69, active
++ *            high. It is the panel I/O rail and is already on because the
++ *            display is lit, so it is left alone unless umi_touch_avdd=1.
++ *   panel    fts,x-max 1080, fts,y-max 2340, focaltech,max-touch-number 10.
++ *
++ * Protocol: no linear register file. A register access is command byte 0xB6
++ * plus a 16-bit address, and a read answers with one dummy byte in front of
++ * the data (ftsIO.c:readCmdU16). An event is a different shape: command 0x85
++ * and eight bytes back, no address and no dummy byte (fts.c:
++ * fts_event_handler). Getting the dummy byte wrong reads data shifted by one,
++ * which is what makes the part look dead.
++ *
++ * TLMM: the GPIO registers are not where soc/pinctrl@f000000 claims. That
++ * node is one 16 MiB window over three separate register tiles, named by the
++ * port's own platform memory map (uefi Platforms/Xiaomi/umiPkg
++ * MemoryMapLib): WEST 0x0f100000, SOUTH 0x0f500000, NORTH 0x0f900000, each
++ * 0x300000. A pin's control register is its tile's base plus 0x1000 * pin,
++ * and the tile a pin belongs to interleaves (see gpio_tile()). All five pins
++ * this driver touches, 36/37/38/39/69, are in SOUTH: gpio36 at 0x0f524000,
++ * gpio39 at 0x0f527000, gpio69 at 0x0f545000. A wrong tile is not a wrong
++ * reading: the address lands in a hole the tile does not decode and the
++ * access is a synchronous external abort, i.e. a dead phone.
++ *
++ * sweet_hid_touch() takes pixels in the 1080x2400 space SweetHIDTouch maps
++ * onto the 1125x2436 surface, so y is scaled from the panel's 2340 rows.
++ *
++ * Everything is off unless umi_touch=1 is on the boot-arg line. The other
++ * boot arguments are diagnostics and also default off:
++ *   umi_touch_verbose=1    one line per bring-up step, and raw events
++ *   umi_touch_diag=1       dump hardware registers 0x0000..0x00ff
++ *   umi_touch_flip=N       1 mirror left-right, 2 top-bottom, 3 both
++ *   umi_touch_pinswap=1    gpio37 is SDA and gpio36 is SCL
++ *   umi_touch_pushpull=1   drive SCL high instead of relying on the pull-up
++ *   umi_touch_bit_us=N     half clock in microseconds (3, about 150 kHz)
++ *   umi_touch_poll_us=N    interrupt poll interval (8000)
++ *   umi_touch_settle_ms=N  time from reset to the first read (200)
++ *   umi_touch_reset=N      1 leaves reset high, 0 leaves it low, 2 no reset
++ *   umi_touch_avdd=1       drive gpio69 (the panel I/O rail) high first
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++void umi_touch_init(void);
++
++/* ---- pins (TLMM) ------------------------------------------------------------------------------- */
++
++#define TLMM_WEST                0x0f100000UL
++#define TLMM_SOUTH               0x0f500000UL
++#define TLMM_NORTH               0x0f900000UL
++#define TLMM_SIZE                0x100000UL
++
++#define GPIO_CFG(n)              (gpio_tile(n) + 0x1000UL * (n)) /* [1:0] pull, [5:2] func, [8:6] drive, [9] output */
++#define GPIO_IO(n)               (GPIO_CFG(n) + 4)               /* bit 0 in, bit 1 out */
++
++#define PULL_NONE                0
++#define PULL_DOWN                1
++#define PULL_UP                  3
++
++#define PIN_SDA                  36      /* qupv3_se13_i2c_active: "qup13" */
++#define PIN_SCL                  37      /* qupv3_se13_i2c_active: "qup13" */
++#define PIN_RESET                38      /* fts,reset-gpio; low = in reset */
++#define PIN_INT                  39      /* fts,irq-gpio; low = a report is waiting */
++#define PIN_AVDD                 69      /* touch_vddio_vreg ("disp_vddio_vreg"), active high */
++
++#define I2C_ADDRESS              0x49    /* fts@49 */
++
++/* ---- the protocol: STMicroelectronics FingerTipS, not FocalTech ------------------------------- */
++
++#define FTS_CMD_HW_REG           0xb6    /* FTS_CMD_HW_REG_R and _W are the same opcode */
++#define FTS_CMD_READ_ONE         0x85    /* FIFO_CMD_READONE: one event, FTS_EVENT_SIZE bytes */
++#define FTS_CMD_SENSE_ON         0x93    /* FTS_CMD_MS_MT_SENSE_ON: start scanning the panel */
++#define FTS_IER_ADDR             0x001c  /* IER_ADDR */
++#define FTS_IER_ENABLE           0x41    /* IER_ENABLE: let the chip drive the interrupt line */
++#define FTS_EVENT_SIZE           8       /* FIFO_EVENT_SIZE */
++#define FTS_FIFO_DEPTH           32      /* FIFO_DEPTH */
++
++/*
++ * FTM3_CHIP is a compile-time switch in the vendor driver and it moves the
++ * ID, the firmware version and the reset register. Nothing says which one
++ * umi is, so both address sets are tried; the one that answers with its
++ * expected ID pair is this part.
++ */
++#define FTS_CHIP_ID_ADDR_A       0x0004  /* DCHIP_ID_ADDR, FTM3_CHIP undefined */
++#define FTS_CHIP_ID_ADDR_B       0x0007  /* DCHIP_ID_ADDR, FTM3_CHIP defined */
++#define FTS_FW_VER_ADDR_A        0x0008  /* DCHIP_FW_VER_ADDR, undefined */
++#define FTS_FW_VER_ADDR_B        0x000a  /* DCHIP_FW_VER_ADDR, defined */
++#define FTS_FW_VER_BYTES         2       /* DCHIP_FW_VER_BYTE */
++
++#define FTS_ID_0_A               0x36    /* DCHIP_ID_0, DCHIP_ID_1: undefined */
++#define FTS_ID_1_A               0x70
++#define FTS_ID_0_B               0x39    /* FTM3_CHIP defined */
++#define FTS_ID_1_B               0x6c
++
++/* Event ids, ftsSoftware.h. */
++#define EVENTID_NO_EVENT         0x00
++#define EVENTID_ENTER_POINTER    0x03
++#define EVENTID_LEAVE_POINTER    0x04
++#define EVENTID_MOTION_POINTER   0x05
++
++#define FTS_MAX_TOUCHES          10      /* focaltech,max-touch-number */
++
++#define PANEL_X                  1080    /* fts,x-max */
++#define PANEL_Y                  2340    /* fts,y-max */
++/*
++ * SweetHIDTouch clamps to and maps a 1080x2400 digitizer area (SweetHID.cpp:
++ * fLogicalW/fLogicalH, fOffX/fOffY, x > 1079 / y > 2399). The panel reports
++ * 2340 rows, so y is stretched over the 2400 rows the HID service expects.
++ */
++#define HID_X                    1080
++#define HID_Y                    2400
++
++/* ---- state ------------------------------------------------------------------------------------- */
++
++static vm_offset_t tlmm_west, tlmm_south, tlmm_north;
++static unsigned pin_sda = PIN_SDA, pin_scl = PIN_SCL;
++static uint32_t bit_us = 3;
++static uint32_t poll_us = 8000;
++static uint32_t settle_ms = 200;
++static uint32_t reset_mode = 1;
++static uint32_t flip;
++static bool pushpull;
++static bool umi_verbose;
++static bool umi_started;
++static int umi_wait_chan;
++
++/* Which tile a pin's registers live in. Not "low pins west, high pins north";
++ * this is the phone's own pin table (see the header comment). */
++static vm_offset_t
++gpio_tile(unsigned pin)
++{
++	if (pin <= 3) {
++		return tlmm_south;
++	}
++	if (pin <= 23) {
++		return tlmm_north;
++	}
++	if (pin <= 27) {
++		return tlmm_south;
++	}
++	if (pin <= 31) {
++		return tlmm_north;
++	}
++	if (pin <= 65) {
++		return tlmm_south;
++	}
++	if (pin <= 68) {
++		return tlmm_north;
++	}
++	if (pin <= 76) {
++		return tlmm_south;
++	}
++	if (pin <= 84) {
++		return tlmm_north;
++	}
++	if (pin <= 91) {
++		return tlmm_south;
++	}
++	if (pin <= 124) {
++		return tlmm_north;
++	}
++	if (pin <= 132) {
++		return tlmm_south;
++	}
++	return tlmm_west;               /* 133 .. 179 */
++}
++
++static inline uint32_t
++tlmm_rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++tlmm_wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++/*
++ * Waits spin on the timebase. A bit-banged clock wants the line held for three
++ * microseconds, and clock_interval_to_deadline() is exact; the scheduler is
++ * not involved. The long waits (reset, settle) are one-off at bring-up.
++ */
++static void
++umi_spin_us(uint32_t us)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		/* spin */
++	}
++}
++
++static void
++umi_spin_ms(uint32_t ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		/* spin */
++	}
++}
++
++/* The polling loop sleeps rather than spins, so one CPU is not eaten alive. */
++static void
++umi_sleep_us(uint32_t us)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline(&umi_wait_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
++{
++	uint32_t cfg = tlmm_rd(GPIO_CFG(pin));
++
++	cfg &= ~0x3ffu;
++	cfg |= pull | (function << 2) | ((ma / 2 - 1) << 6) | (output ? (1u << 9) : 0);
++	tlmm_wr(GPIO_CFG(pin), cfg);
++}
++
++static void
++gpio_set(unsigned pin, bool high)
++{
++	tlmm_wr(GPIO_IO(pin), high ? 2 : 0);
++}
++
++static bool
++gpio_get(unsigned pin)
++{
++	return (tlmm_rd(GPIO_IO(pin)) & 1) != 0;
++}
++
++static void
++gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
++{
++	gpio_set(pin, high);            /* the level first, so that the pin never drives the wrong one */
++	gpio_configure(pin, 0, pull, ma, true);
++}
++
++/* What the pins look like: said once, so a run that goes nowhere still says why. */
++static void
++show_pins(const char *when)
++{
++	printf("UMI TOUCH: %s: sda %#x/%u scl %#x/%u reset %#x/%u int %#x/%u\n", when,
++	    (uint32_t)tlmm_rd(GPIO_CFG(pin_sda)), gpio_get(pin_sda),
++	    (uint32_t)tlmm_rd(GPIO_CFG(pin_scl)), gpio_get(pin_scl),
++	    (uint32_t)tlmm_rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET),
++	    (uint32_t)tlmm_rd(GPIO_CFG(PIN_INT)), gpio_get(PIN_INT));
++}
++
++/* ---- I2C by hand ------------------------------------------------------------------------------- */
++
++/*
++ * A line is open drain: released is an input with the pull-up on, pulled down
++ * is an output driving zero.
++ */
++static void
++line_release(unsigned pin)
++{
++	if (pushpull) {
++		gpio_output(pin, true, PULL_NONE, 2);
++	} else {
++		gpio_configure(pin, 0, PULL_UP, 2, false);
++	}
++}
++
++static void
++line_low(unsigned pin)
++{
++	gpio_output(pin, false, PULL_NONE, 2);
++}
++
++static void
++i2c_delay(void)
++{
++	umi_spin_us(bit_us);
++}
++
++/*
++ * A slave that is not ready holds SCL down (clock stretching). Reading through
++ * that without waiting is what makes a live chip answer every register with
++ * zeros, so the release waits -- four milliseconds, far more than a part with
++ * the byte ready needs and far less than a stuck one would ever take. If SCL
++ * really is stuck the deadline bounds the damage; umi_touch_pushpull=1 exists
++ * for a board whose pull-ups are not powered in this boot environment.
++ */
++static unsigned scl_limit_us = 4000;
++
++static void
++scl_high(void)
++{
++	uint64_t deadline;
++
++	line_release(pin_scl);
++	clock_interval_to_deadline(scl_limit_us, NSEC_PER_USEC, &deadline);
++	while (!gpio_get(pin_scl) && mach_absolute_time() < deadline) {
++		/* the slave is holding SCL down; that is it asking for time */
++	}
++}
++
++static void
++i2c_start(void)
++{
++	line_release(pin_sda);
++	scl_high();
++	i2c_delay();
++	line_low(pin_sda);              /* SDA falls while SCL is high */
++	i2c_delay();
++	line_low(pin_scl);
++	i2c_delay();
++}
++
++static void
++i2c_stop(void)
++{
++	line_low(pin_sda);
++	i2c_delay();
++	scl_high();                     /* SCL rises */
++	i2c_delay();
++	line_release(pin_sda);          /* SDA rises while SCL is high */
++	i2c_delay();
++}
++
++static bool
++i2c_write_byte(uint8_t value)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		if (value >> bit & 1) {
++			line_release(pin_sda);
++		} else {
++			line_low(pin_sda);
++		}
++		i2c_delay();
++		scl_high();
++		i2c_delay();
++		line_low(pin_scl);
++		i2c_delay();
++	}
++	/* the acknowledge: the chip holds SDA down for one clock */
++	line_release(pin_sda);
++	i2c_delay();
++	scl_high();
++	i2c_delay();
++	bool ack = !gpio_get(pin_sda);
++	line_low(pin_scl);
++	i2c_delay();
++	return ack;
++}
++
++static uint8_t
++i2c_read_byte(bool ack)
++{
++	uint8_t value = 0;
++
++	line_release(pin_sda);
++	for (int bit = 7; bit >= 0; bit--) {
++		i2c_delay();
++		scl_high();
++		i2c_delay();
++		bool sample = gpio_get(pin_sda);
++
++		value = (uint8_t)(value << 1 | (sample ? 1 : 0));
++		line_low(pin_scl);
++		i2c_delay();
++	}
++	/* our acknowledge: SDA down for the bytes we want more of, up for the last one */
++	if (ack) {
++		line_low(pin_sda);
++	}
++	i2c_delay();
++	scl_high();
++	i2c_delay();
++	line_low(pin_scl);
++	line_release(pin_sda);
++	i2c_delay();
++	return value;
++}
++
++/*
++ * A transfer left half finished holds a line down; nine clocks let the chip
++ * let go of it. Both lines are checked, not just SDA: a slave waiting for the
++ * rest of a byte stretches the clock, and SDA can be high at the same time.
++ */
++static void
++i2c_bus_recover(void)
++{
++	int pulses;
++
++	line_release(pin_sda);
++	line_release(pin_scl);
++	i2c_delay();
++	if (gpio_get(pin_sda) && gpio_get(pin_scl)) {
++		return;                 /* both lines high: the bus is idle */
++	}
++	printf("UMI TOUCH: the bus is stuck (sda %u scl %u); clocking it free\n",
++	    gpio_get(pin_sda), gpio_get(pin_scl));
++	for (pulses = 0; pulses < 9 && !(gpio_get(pin_sda) && gpio_get(pin_scl)); pulses++) {
++		line_low(pin_scl);
++		i2c_delay();
++		line_release(pin_scl);
++		i2c_delay();
++	}
++	line_low(pin_sda);
++	i2c_delay();
++	line_release(pin_scl);
++	i2c_delay();
++	line_release(pin_sda);
++	i2c_delay();
++	printf("UMI TOUCH: ... %d pulse(s), sda %u scl %u\n", pulses,
++	    gpio_get(pin_sda), gpio_get(pin_scl));
++}
++
++/* ---- the FingerTipS protocol on top of the bit-bang -------------------------------------------- */
++
++/*
++ * Read `length` bytes of the hardware register at `address`: write
++ * {0xB6, hi, lo}, repeated start, then length + 1 bytes because the chip puts
++ * one dummy byte in front of the data (DUMMY_HW_REG is 1 for every hardware
++ * register on this part). Dropping the dummy is not optional.
++ */
++static bool
++fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
++{
++	uint8_t buf[FTS_FIFO_DEPTH + 1];
++	bool ok = false;
++
++	if (length > sizeof(buf) - 1) {
++		return false;
++	}
++	memset(buf, 0, length + 1);
++	i2c_start();
++	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTS_CMD_HW_REG) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address & 0xff))) {
++		i2c_start();
++		if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1))) {
++			for (uint32_t i = 0; i <= length; i++) {
++				buf[i] = i2c_read_byte(i < length);
++			}
++			memcpy(data, buf + 1, length);
++			ok = true;
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
++/* writeCmdU16: {0xB6, hi, lo, data ...} in one transaction. */
++static bool
++fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
++{
++	bool ok;
++
++	i2c_start();
++	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTS_CMD_HW_REG) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address & 0xff));
++	for (uint32_t i = 0; ok && i < length; i++) {
++		ok = i2c_write_byte(data[i]);
++	}
++	i2c_stop();
++	return ok;
++}
++
++/* A command is one byte out and nothing back (fts_writeCmd with one byte). */
++static bool
++fts_command(uint8_t command)
++{
++	bool ok;
++
++	i2c_start();
++	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) && i2c_write_byte(command);
++	i2c_stop();
++	return ok;
++}
++
++/*
++ * One event out of the FIFO: command 0x85, then eight bytes. There is no
++ * address and no dummy byte here -- that is only for hardware registers. The
++ * first byte is the event id; 0x00 means the FIFO is empty.
++ */
++static bool
++fts_read_event(uint8_t *event)
++{
++	bool ok = false;
++
++	memset(event, 0, FTS_EVENT_SIZE);
++	i2c_start();
++	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(FTS_CMD_READ_ONE)) {
++		i2c_start();
++		if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1))) {
++			for (uint32_t i = 0; i < FTS_EVENT_SIZE; i++) {
++				event[i] = i2c_read_byte(i + 1 < FTS_EVENT_SIZE);
++			}
++			ok = true;
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
++/* ---- the chip ---------------------------------------------------------------------------------- */
++
++static struct {
++	uint32_t polls, reports, touches, bad, last_x, last_y;
++} seen;
++
++static struct {
++	bool down;
++	uint32_t x, y;
++} contact[FTS_MAX_TOUCHES];
++
++static void
++report_touch(uint32_t id, bool down, uint32_t x, uint32_t y)
++{
++	static unsigned shown;
++
++	if (id >= FTS_MAX_TOUCHES) {
++		return;
++	}
++	if (!down) {
++		if (contact[id].down) {
++			contact[id].down = false;
++			sweet_hid_touch((int)id, 0, (int)contact[id].x, (int)contact[id].y);
++		}
++		return;
++	}
++	if (x >= PANEL_X) {
++		x = PANEL_X - 1;
++	}
++	if (y >= PANEL_Y) {
++		y = PANEL_Y - 1;
++	}
++	seen.touches++;
++	seen.last_x = x;
++	seen.last_y = y;
++	switch (flip) {
++	case 1: x = PANEL_X - 1 - x; break;
++	case 2: y = PANEL_Y - 1 - y; break;
++	case 3: x = PANEL_X - 1 - x; y = PANEL_Y - 1 - y; break;
++	}
++	/* Panel pixels -> the 1080x2400 digitizer area SweetHIDTouch maps. */
++	x = (x * (HID_X - 1)) / (PANEL_X - 1);
++	y = (y * (HID_Y - 1)) / (PANEL_Y - 1);
++	if (!contact[id].down) {
++		contact[id].down = true;
++		sweet_hid_touch((int)id, 1, (int)x, (int)y);
++		if (umi_verbose && shown++ < 8) {
++			printf("UMI TOUCH: finger %u down at %u, %u\n", id, x, y);
++		}
++	} else if (contact[id].x != x || contact[id].y != y) {
++		sweet_hid_touch((int)id, 1, (int)x, (int)y);
++	}
++	contact[id].x = x;
++	contact[id].y = y;
++}
++
++/*
++ * One event, in the layout fts.c reads it:
++ *   event[0]   id: 0x03 enter, 0x04 leave, 0x05 motion (same handler as enter)
++ *   event[1]   [7:4] how many fingers are down, [3:0] this finger's slot
++ *   event[2]   x bits 11..4      event[3]   y bits 11..4
++ *   event[4]   [7:4] x bits 3..0, [3:0] y bits 3..0
++ * The chip sends one event per finger per change and nothing when nothing
++ * happens, so a lifted finger is an 0x04 event, not a missing slot.
++ */
++static void
++parse_event(const uint8_t *event)
++{
++	uint32_t id = event[1] & 0x0f;
++	uint32_t x = ((uint32_t)event[2] << 4) | ((event[4] & 0xf0) >> 4);
++	uint32_t y = ((uint32_t)event[3] << 4) | (event[4] & 0x0f);
++
++	seen.reports++;
++	report_touch(id, event[0] != EVENTID_LEAVE_POINTER, x, y);
++}
++
++static void
++poll_report(void)
++{
++	uint8_t event[FTS_EVENT_SIZE];
++	static unsigned shown_raw;
++
++	seen.polls++;
++	/*
++	 * Drain the FIFO: the chip queues one event per finger per change, up to
++	 * FIFO_DEPTH, and 0x00 means empty. Reading one event per look and
++	 * stopping would leave a queue behind and the touch would lag.
++	 */
++	for (unsigned i = 0; i < FTS_FIFO_DEPTH; i++) {
++		if (!fts_read_event(event)) {
++			seen.bad++;
++			return;
++		}
++		if (event[0] == EVENTID_NO_EVENT) {
++			return;
++		}
++		if (umi_verbose && shown_raw < 8) {
++			shown_raw++;
++			printf("UMI TOUCH: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    event[0], event[1], event[2], event[3],
++			    event[4], event[5], event[6], event[7]);
++		}
++		switch (event[0]) {
++		case EVENTID_ENTER_POINTER:
++		case EVENTID_MOTION_POINTER:
++		case EVENTID_LEAVE_POINTER:
++			parse_event(event);
++			break;
++		default:
++			break;  /* status, errors and the rest are not needed to move a cursor */
++		}
++	}
++}
++
++/* ---- bring-up ---------------------------------------------------------------------------------- */
++
++static void
++pins_for_i2c(void)
++{
++	line_release(pin_sda);
++	scl_high();
++	gpio_output(PIN_RESET, false, PULL_UP, 8);      /* held in reset until the chip is asked for */
++	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
++}
++
++/*
++ * Both of the vendor driver's compile-time variants are asked: the digital
++ * chip ID and the firmware version live at 0x0004/0x0008 without FTM3_CHIP
++ * and at 0x0007/0x000a with it, and the expected ID pairs are 36 70 and 39
++ * 6c. Whichever answers is this phone's part, and the answer is also the
++ * first proof that the protocol is right.
++ */
++static bool
++read_chip_id(uint8_t *high, uint8_t *low)
++{
++	static const struct {
++		uint16_t id, fw;
++		uint8_t id0, id1;
++		const char *name;
++	} variant[2] = {
++		{ FTS_CHIP_ID_ADDR_A, FTS_FW_VER_ADDR_A, FTS_ID_0_A, FTS_ID_1_A, "without FTM3_CHIP" },
++		{ FTS_CHIP_ID_ADDR_B, FTS_FW_VER_ADDR_B, FTS_ID_0_B, FTS_ID_1_B, "with FTM3_CHIP" },
++	};
++
++	for (unsigned v = 0; v < 2; v++) {
++		uint8_t id[2] = { 0, 0 };
++		uint8_t fw[FTS_FW_VER_BYTES] = { 0, 0 };
++		bool id_ok, fw_ok;
++
++		id_ok = fts_read_registers(variant[v].id, id, sizeof(id));
++		fw_ok = fts_read_registers(variant[v].fw, fw, sizeof(fw));
++		if (!id_ok) {
++			continue;
++		}
++		if (umi_verbose) {
++			printf("UMI TOUCH: id at %#06x %s: %02x %02x%s; fw at %#06x: %02x %02x%s\n",
++			    variant[v].id, variant[v].name, id[0], id[1],
++			    (id[0] == variant[v].id0 && id[1] == variant[v].id1) ? " -- that is this part" : "",
++			    variant[v].fw, fw[0], fw_ok ? fw[1] : 0, fw_ok ? "" : " (read failed)");
++		}
++		if (id[0] == variant[v].id0 && id[1] == variant[v].id1) {
++			*high = id[0];
++			*low = id[1];
++			return true;
++		}
++	}
++	return false;                   /* nothing answered with a known id pair */
++}
++
++/* One try at one pin order: reset the chip, let it boot, ask who it is. */
++static bool
++probe(unsigned sda, unsigned scl)
++{
++	uint8_t high = 0, low = 0;
++
++	pin_sda = sda;
++	pin_scl = scl;
++	pins_for_i2c();
++	i2c_bus_recover();
++
++	/*
++	 * The reset line is active low: the vendor's fts_chip_powercycle2
++	 * asserts it (low), brings the supplies up and releases it (high).
++	 * umi_touch_reset picks the level the sequence settles at: 1 high (the
++	 * vendor's), 0 low, 2 leaves the line alone. Either way the pulse goes
++	 * the other way first, so there is a real edge.
++	 */
++	if (reset_mode != 2) {
++		bool settle_high = reset_mode != 0;
++
++		gpio_set(PIN_RESET, !settle_high);
++		umi_spin_ms(2);
++		gpio_set(PIN_RESET, settle_high);
++	}
++	umi_spin_ms(settle_ms);         /* fts_reset_proc, then time to boot the application */
++
++	for (int attempt = 0; attempt < 5; attempt++) {
++		if (read_chip_id(&high, &low)) {
++			printf("UMI TOUCH: chip at %#x on sda gpio%u / scl gpio%u: id %02x %02x (attempt %d)\n",
++			    I2C_ADDRESS, pin_sda, pin_scl, high, low, attempt + 1);
++			return true;
++		}
++		umi_spin_ms(50);
++	}
++	if (umi_verbose) {
++		printf("UMI TOUCH: no answer at %#x on sda gpio%u / scl gpio%u\n",
++		    I2C_ADDRESS, pin_sda, pin_scl);
++	}
++	return false;
++}
++
++/* umi_touch_diag=1: the chip's map, 16 registers a line, in the loader's log. */
++static void
++register_dump(void)
++{
++	uint8_t line[16];
++
++	printf("UMI TOUCH: hardware registers 0x0000..0x00ff at %#x:\n", I2C_ADDRESS);
++	for (unsigned base = 0; base < 256; base += 16) {
++		for (unsigned i = 0; i < 16; i++) {
++			line[i] = 0xff;
++			if (!fts_read_registers((uint16_t)(base + i), &line[i], 1)) {
++				line[i] = 0xfe; /* no acknowledge */
++			}
++		}
++		printf("UMI TOUCH: %04x: %02x %02x %02x %02x %02x %02x %02x %02x "
++		    "%02x %02x %02x %02x %02x %02x %02x %02x\n", base,
++		    line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
++		    line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]);
++	}
++}
++
++static void
++umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	uint32_t diag = 0, avdd = 0, swap = 0, pp = 0, v = 0;
++	unsigned idle = 0, idle_looks;
++	bool found = false;
++
++	(void)PE_parse_boot_argn("umi_touch_verbose", &v, sizeof(v));
++	umi_verbose = v != 0;
++	(void)PE_parse_boot_argn("umi_touch_diag", &diag, sizeof(diag));
++	(void)PE_parse_boot_argn("umi_touch_avdd", &avdd, sizeof(avdd));
++	(void)PE_parse_boot_argn("umi_touch_pinswap", &swap, sizeof(swap));
++	(void)PE_parse_boot_argn("umi_touch_pushpull", &pp, sizeof(pp));
++	(void)PE_parse_boot_argn("umi_touch_flip", &flip, sizeof(flip));
++	(void)PE_parse_boot_argn("umi_touch_bit_us", &bit_us, sizeof(bit_us));
++	(void)PE_parse_boot_argn("umi_touch_poll_us", &poll_us, sizeof(poll_us));
++	(void)PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
++	(void)PE_parse_boot_argn("umi_touch_reset", &reset_mode, sizeof(reset_mode));
++	pushpull = pp != 0;
++	if (bit_us < 1 || bit_us > 1000) {
++		bit_us = 3;
++	}
++	if (poll_us < 250 || poll_us > 100000) {
++		poll_us = 8000;
++	}
++	if (settle_ms > 5000) {
++		settle_ms = 5000;
++	}
++	if (reset_mode > 2) {
++		reset_mode = 1;
++	}
++
++	tlmm_west = ml_io_map(TLMM_WEST, TLMM_SIZE);
++	tlmm_south = ml_io_map(TLMM_SOUTH, TLMM_SIZE);
++	tlmm_north = ml_io_map(TLMM_NORTH, TLMM_SIZE);
++	if (!tlmm_west || !tlmm_south || !tlmm_north) {
++		printf("UMI TOUCH: cannot map TLMM (west %u south %u north %u); giving up\n",
++		    (uint32_t)tlmm_west, (uint32_t)tlmm_south, (uint32_t)tlmm_north);
++		goto out;
++	}
++	if (umi_verbose) {
++		printf("UMI TOUCH: tlmm west %#x south %#x north %#x; gpio%u..%u and gpio%u are in south\n",
++		    (uint32_t)TLMM_WEST, (uint32_t)TLMM_SOUTH, (uint32_t)TLMM_NORTH,
++		    PIN_SDA, PIN_INT, PIN_AVDD);
++	}
++	show_pins("as found");
++
++	if (swap) {
++		unsigned t = pin_sda;
++
++		pin_sda = pin_scl;
++		pin_scl = t;
++		printf("UMI TOUCH: sda gpio%u and scl gpio%u, the other way round\n", pin_sda, pin_scl);
++	}
++	if (avdd) {
++		printf("UMI TOUCH: gpio%u, the panel I/O rail's enable, is %#x/%u; driving it high\n",
++		    PIN_AVDD, (uint32_t)tlmm_rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
++		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
++		umi_spin_ms(5);
++	}
++	/*
++	 * Which of gpio36/gpio37 is SDA and which is SCL is not written down
++	 * anywhere, and the wrong way round is not an error the chip can report.
++	 * So both are tried, and only the one that answers is kept.
++	 */
++	for (int attempt = 0; attempt < 2 && !found; attempt++) {
++		unsigned sda = attempt == 0 ? PIN_SDA : PIN_SCL;
++		unsigned scl = attempt == 0 ? PIN_SCL : PIN_SDA;
++
++		if (swap) {
++			unsigned t = sda;
++			sda = scl;
++			scl = t;
++		}
++		found = probe(sda, scl);
++	}
++	if (!found) {
++		printf("UMI TOUCH: no FingerTipS touch screen on I2C %#x\n", I2C_ADDRESS);
++		show_pins("no answer");
++		goto out;
++	}
++	show_pins("answering");
++	if (diag) {
++		register_dump();
++	}
++	/*
++	 * A chip that has just been reset is not scanning the panel and is not
++	 * driving its interrupt line, so neither the FIFO nor gpio39 would ever
++	 * say anything. The vendor driver does these two things on resume
++	 * (fts.c: fts_command(FTS_CMD_MS_MT_SENSE_ON) and IER_ENABLE to
++	 * IER_ADDR); without them this loop would poll an idle part forever and
++	 * look exactly like a driver that cannot read the chip.
++	 */
++	{
++		uint8_t ier = FTS_IER_ENABLE;
++		bool sense_ok = fts_command(FTS_CMD_SENSE_ON);
++		bool ier_ok = fts_write_registers(FTS_IER_ADDR, &ier, 1);
++
++		printf("UMI TOUCH: sense on: %s; interrupt enable: %s\n",
++		    sense_ok ? "acked" : "not acked", ier_ok ? "acked" : "not acked");
++		umi_spin_ms(20);
++	}
++	printf("UMI TOUCH: FingerTipS ready at %#x, sda gpio%u / scl gpio%u, poll every %u us, panel %ux%u\n",
++	    I2C_ADDRESS, pin_sda, pin_scl, poll_us, PANEL_X, PANEL_Y);
++
++	idle_looks = 80000 / poll_us;   /* read every 80 ms even if the line stays high */
++	for (unsigned tick = 1;; tick++) {
++		if (!gpio_get(PIN_INT)) {
++			idle = 0;
++			poll_report();
++		} else if (++idle >= idle_looks) {
++			idle = 0;
++			poll_report();
++		}
++		if (umi_verbose && (tick % 7500) == 0) {
++			printf("UMI TOUCH: %u reports in %u looks (%u bad), %u positions, last %u,%u; int %s\n",
++			    seen.reports, seen.polls, seen.bad, seen.touches,
++			    seen.last_x, seen.last_y, gpio_get(PIN_INT) ? "high" : "low");
++		}
++		umi_sleep_us(poll_us);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++umi_touch_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (umi_started) {
++		return;
++	}
++	if (!PE_parse_boot_argn("umi_touch", &enabled, sizeof(enabled)) || !enabled) {
++		return;
++	}
++	umi_started = true;
++	kr = kernel_thread_start(umi_touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("UMI TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/umi_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,5 +56,6 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void umi_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -693,5 +693,13 @@
++	/*
++	 * SWEET: the umi (Mi 10) panel's FingerTipS controller, when asked for
++	 * with umi_touch=1. Off by default, and it brings up its own bit-banged
++	 * I2C and thread, so it does not replace the GT9896 drivers above (they
++	 * stay staged off until their buses are initialized). See bsd/dev/
++	 * umi_touch.c.
++	 */
++	umi_touch_init();
+ 	return 0;
+ }
+ 
+ /*
+  * Persistent console log ("sweetlog"). Filming the phone screen is the only
