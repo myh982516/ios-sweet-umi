@@ -1,0 +1,649 @@
+--- a/bsd/dev/umi_touch.c
++++ b/bsd/dev/umi_touch.c
+@@ -60,6 +60,15 @@
+  *   umi_touch_settle_ms=N  time from reset to the first read (200)
+  *   umi_touch_reset=N      1 leaves reset high, 0 leaves it low, 2 no reset
+  *   umi_touch_avdd=1       drive gpio69 (the panel I/O rail) high first
++ *   umi_touch_ack=1        one line per register read with the acknowledge bit
++ *                          of every byte it sent, separately from the data
++ *   umi_touch_scan=1       ask every address on the bus who is there
++ *   umi_touch_intmon=1     gpio39 sampled through a reset, and the data line
++ *                          sampled a millisecond after a read
++ *   umi_touch_proto=1      the id through sixteen opcodes, sixteen write and
++ *                          read-backs, then sense-on and the id again
++ *   umi_touch_clear=N      N clock pulses on the bus before each probe (0)
++ *   umi_touch_reset_pulses=N  reset pulses per probe (1, the vendor's order)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -159,6 +168,32 @@
+ static bool umi_started;
+ static int umi_wait_chan;
+ 
++/*
++ * The acknowledge bits of the transfer that is running, one per byte written,
++ * in the order the bytes went out. The old code kept only the AND of them, so
++ * "nothing is at 0x49" and "0x49 acknowledges and answers 0x00" both came out
++ * as a failed read over a data buffer of zeros -- two opposite diagnoses that
++ * the log could not tell apart. See report_read().
++ */
++static uint32_t ack_bits;               /* bit n: write byte n was acknowledged */
++static unsigned ack_writes;             /* how many bytes have been written */
++static bool ack_read;                   /* the read address was acknowledged */
++static bool ack_read_tried;             /* a read address has been sent */
++static unsigned nak_write;              /* 1-based number of the first NAKed byte */
++
++/* umi_touch_ack=1: one line per register read, acknowledges and data apart. */
++static bool umi_ack;
++
++/* umi_touch_scan=1, umi_touch_intmon=1, umi_touch_proto=1. */
++static bool umi_scan, umi_intmon, umi_proto;
++
++/* umi_touch_clear=N and umi_touch_reset_pulses=N. */
++static uint32_t clear_pulses;
++static uint32_t reset_pulses = 1;
++
++/* How the clock behaved: scl_high() counts the clocks that never came back. */
++static unsigned scl_clocks, scl_slow;
++
+ /* Which tile a pin's registers live in. Not "low pins west, high pins north";
+  * this is the phone's own pin table (see the header comment). */
+ static vm_offset_t
+@@ -333,11 +368,15 @@
+ {
+ 	uint64_t deadline;
+ 
++	scl_clocks++;
+ 	line_release(pin_scl);
+ 	clock_interval_to_deadline(scl_limit_us, NSEC_PER_USEC, &deadline);
+ 	while (!gpio_get(pin_scl) && mach_absolute_time() < deadline) {
+ 		/* the slave is holding SCL down; that is it asking for time */
+ 	}
++	if (!gpio_get(pin_scl)) {
++		scl_slow++;             /* it never let go: the clock is not ours */
++	}
+ }
+ 
+ static void
+@@ -384,6 +423,16 @@
+ 	scl_high();
+ 	i2c_delay();
+ 	bool ack = !gpio_get(pin_sda);
++	/* keep it, so that a NAK can be named instead of being reported as a zero */
++	if (ack_writes < 32) {
++		if (ack) {
++			ack_bits |= 1u << ack_writes;
++		}
++	}
++	ack_writes++;
++	if (!ack && nak_write == 0) {
++		nak_write = ack_writes;
++	}
+ 	line_low(pin_scl);
+ 	i2c_delay();
+ 	return ack;
+@@ -452,6 +501,119 @@
+ 	    gpio_get(pin_sda), gpio_get(pin_scl));
+ }
+ 
++/*
++ * Nine clocks with the data line let go, which is how a slave that is waiting
++ * for the rest of a byte is told to forget it.
++ *
++ * i2c_bus_recover() above does this only when a line reads low, and it returns
++ * at once when both read high -- which, with ldoc1 on, they always do. So the
++ * one clear that costs nothing has never been sent on this boot path, and a
++ * slave left half way through a byte by the previous run (fastboot boot does
++ * not power-cycle the SoC) keeps every bit of that state across resets. Reset
++ * resets the receiving core, not the shift register that is holding SDA down.
++ * umi_touch_clear=N sends N of them unconditionally, before the reset.
++ */
++static void
++i2c_clock_clear(unsigned pulses)
++{
++	line_release(pin_sda);
++	for (unsigned i = 0; i < pulses; i++) {
++		line_low(pin_scl);
++		i2c_delay();
++		line_release(pin_scl);
++		i2c_delay();
++	}
++	i2c_stop();
++}
++
++/* Every transfer starts by forgetting what the last one's acknowledge bits were. */
++static void
++i2c_ack_reset(void)
++{
++	ack_bits = 0;
++	ack_writes = 0;
++	ack_read = false;
++	ack_read_tried = false;
++	nak_write = 0;
++}
++
++/*
++ * The read address, on its own: the one byte in a register read that says
++ * whether anything is at that address at all. The three bytes before it are
++ * acknowledged by any slave that recognised the address, whatever they mean,
++ * so only this one and the first one carry information about presence.
++ */
++static bool
++i2c_write_read_address(void)
++{
++	ack_read_tried = true;
++	ack_read = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1));
++	return ack_read;
++}
++
++#define ACK_MASK_MAX 10
++
++/* "AAAA" -- one character per write byte, in the order they went out. */
++static void
++ack_string(char *out, size_t size)
++{
++	unsigned i, n = 0;
++
++	for (i = 0; i < ack_writes && i < 8 && n + 1 < size; i++) {
++		out[n++] = (ack_bits >> i) & 1 ? 'A' : '.';
++	}
++	if (n == 0 && n + 1 < size) {
++		out[n++] = '-';
++	}
++	out[n] = '\0';
++}
++
++/*
++ * One register read, said as two separate facts: which bytes were
++ * acknowledged, and what came back. A read that was not acknowledged has no
++ * data at all -- the buffer is untouched -- so printing the zeros it was
++ * initialised to is what made "the chip is not there" and "the chip answers
++ * zero" the same line in the log.
++ */
++static void
++report_read(const char *what, uint16_t address, const uint8_t *data, bool ok)
++{
++	char mask[ACK_MASK_MAX];
++
++	ack_string(mask, sizeof(mask));
++	if (!ok) {
++		printf("UMI TOUCH: %s %#06x: ack %s, read %s (first NAK: byte %u), no data\n",
++		    what, address, mask, ack_read_tried ? "NAKed" : "not reached", nak_write);
++		return;
++	}
++	printf("UMI TOUCH: %s %#06x: ack %s, read acked, data %02x %02x\n",
++	    what, address, mask, data[0], data[1]);
++}
++
++/* Ask every 7-bit address on the bus who is there. Nothing is written anywhere. */
++static unsigned
++i2c_scan(void)
++{
++	unsigned found = 0;
++
++	printf("UMI TOUCH: scanning 0x08..0x77 for an acknowledge\n");
++	for (unsigned a = 0x08; a <= 0x77; a++) {
++		i2c_ack_reset();
++		i2c_start();
++		if (i2c_write_byte((uint8_t)(a << 1))) {
++			printf("UMI TOUCH:   %#04x acknowledges\n", a);
++			found++;
++		}
++		i2c_stop();
++	}
++	printf("UMI TOUCH: %u of 112 addresses acknowledge\n", found);
++	if (found > 8) {
++		printf("UMI TOUCH: that is not a bus of peripherals: every byte is reading "
++		    "back as an acknowledge, so no acknowledge on it means anything\n");
++	}
++	return found;
++}
++
+ /* ---- the FingerTipS protocol on top of the bit-bang -------------------------------------------- */
+ 
+ /*
+@@ -469,14 +631,47 @@
+ 	if (length > sizeof(buf) - 1) {
+ 		return false;
+ 	}
++	memset(data, 0, length);
+ 	memset(buf, 0, length + 1);
++	i2c_ack_reset();
+ 	i2c_start();
+ 	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
+ 	    i2c_write_byte(FTS_CMD_HW_REG) &&
+ 	    i2c_write_byte((uint8_t)(address >> 8)) &&
+ 	    i2c_write_byte((uint8_t)(address & 0xff))) {
+ 		i2c_start();
+-		if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1))) {
++		if (i2c_write_read_address()) {
++			for (uint32_t i = 0; i <= length; i++) {
++				buf[i] = i2c_read_byte(i < length);
++			}
++			memcpy(data, buf + 1, length);
++			ok = true;
++		}
++	}
++	i2c_stop();
++	return ok;
++}
++
++/* The same read with the opcode spelled out: umi_touch_proto=1 walks a table of them. */
++static bool
++fts_read_raw(uint8_t op, uint16_t address, uint8_t *data, uint32_t length)
++{
++	uint8_t buf[FTS_FIFO_DEPTH + 1];
++	bool ok = false;
++
++	if (length > sizeof(buf) - 1) {
++		return false;
++	}
++	memset(data, 0, length);
++	memset(buf, 0, length + 1);
++	i2c_ack_reset();
++	i2c_start();
++	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
++	    i2c_write_byte(op) &&
++	    i2c_write_byte((uint8_t)(address >> 8)) &&
++	    i2c_write_byte((uint8_t)(address & 0xff))) {
++		i2c_start();
++		if (i2c_write_read_address()) {
+ 			for (uint32_t i = 0; i <= length; i++) {
+ 				buf[i] = i2c_read_byte(i < length);
+ 			}
+@@ -494,6 +689,7 @@
+ {
+ 	bool ok;
+ 
++	i2c_ack_reset();
+ 	i2c_start();
+ 	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
+ 	    i2c_write_byte(FTS_CMD_HW_REG) &&
+@@ -512,6 +708,7 @@
+ {
+ 	bool ok;
+ 
++	i2c_ack_reset();
+ 	i2c_start();
+ 	ok = i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) && i2c_write_byte(command);
+ 	i2c_stop();
+@@ -529,11 +726,12 @@
+ 	bool ok = false;
+ 
+ 	memset(event, 0, FTS_EVENT_SIZE);
++	i2c_ack_reset();
+ 	i2c_start();
+ 	if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1)) &&
+ 	    i2c_write_byte(FTS_CMD_READ_ONE)) {
+ 		i2c_start();
+-		if (i2c_write_byte((uint8_t)(I2C_ADDRESS << 1 | 1))) {
++		if (i2c_write_read_address()) {
+ 			for (uint32_t i = 0; i < FTS_EVENT_SIZE; i++) {
+ 				event[i] = i2c_read_byte(i + 1 < FTS_EVENT_SIZE);
+ 			}
+@@ -675,7 +873,14 @@
+  * and at 0x0007/0x000a with it, and the expected ID pairs are 36 70 and 39
+  * 6c. Whichever answers is this phone's part, and the answer is also the
+  * first proof that the protocol is right.
++ *
++ * The four counters are what probe() reports when nothing matches: how many
++ * reads were made, how many of them the chip acknowledged, and how many of
++ * those answered 00 00. "Acknowledged and zero" and "not acknowledged" are
++ * different faults and only the second one is a bus fault.
+  */
++static uint32_t id_reads, id_acked, id_naked, id_zero;
++
+ static bool
+ read_chip_id(uint8_t *high, uint8_t *low)
+ {
+@@ -694,7 +899,22 @@
+ 		bool id_ok, fw_ok;
+ 
+ 		id_ok = fts_read_registers(variant[v].id, id, sizeof(id));
++		if (umi_ack || umi_verbose) {
++			report_read("id", variant[v].id, id, id_ok);
++		}
+ 		fw_ok = fts_read_registers(variant[v].fw, fw, sizeof(fw));
++		if (umi_ack || umi_verbose) {
++			report_read("fw", variant[v].fw, fw, fw_ok);
++		}
++		id_reads++;
++		if (id_ok) {
++			id_acked++;
++			if (id[0] == 0 && id[1] == 0) {
++				id_zero++;
++			}
++		} else {
++			id_naked++;
++		}
+ 		if (!id_ok) {
+ 			continue;
+ 		}
+@@ -713,6 +933,161 @@
+ 	return false;                   /* nothing answered with a known id pair */
+ }
+ 
++/*
++ * umi_touch_intmon=1: the interrupt line, before the reset, while it is held,
++ * and for a quarter of a second after it is let go; then a register read at
++ * three clock rates, with the data line read again a millisecond after it.
++ *
++ * gpio39 is the only output of this part that is unambiguously the part's own:
++ * INT low means the chip is driving it, and a chip with no supply or one held
++ * in reset cannot. That separates "answering zeros" from "not answering" in a
++ * way no count of zero bytes can. The line read after the transfer separates
++ * them a second way: if SDA is still low once the master has let go, the chip
++ * owns it and every acknowledge recorded above was this driver's own low level
++ * read back through a line the slave was holding down.
++ */
++static bool
++int_line(void)
++{
++	gpio_configure(PIN_INT, 0, PULL_UP, 2, false);
++	umi_spin_us(200);
++	return gpio_get(PIN_INT);
++}
++
++static void
++int_monitor(void)
++{
++	static const uint32_t rates[] = { 3, 10, 50 };
++	uint32_t saved = bit_us;
++	unsigned edges = 0;
++	bool last;
++
++	printf("UMI TOUCH: --- the interrupt line, through a reset ---\n");
++	printf("UMI TOUCH: int before the reset      %u\n", int_line());
++	gpio_output(PIN_RESET, false, PULL_NONE, 2);
++	umi_spin_ms(5);
++	last = int_line();
++	printf("UMI TOUCH: int with reset held low   %u\n", last);
++	gpio_output(PIN_RESET, true, PULL_NONE, 2);
++	for (unsigned i = 0; i < 250; i++) {
++		bool now = int_line();
++
++		if (now != last) {
++			edges++;
++			printf("UMI TOUCH: int -> %u at %u ms after the reset\n", now, i);
++			last = now;
++		}
++		umi_spin_ms(1);
++	}
++	printf("UMI TOUCH: int after the reset       %u, %u edge(s) in 250 ms%s\n",
++	    last, edges, last ? "" : "   <- the chip is holding it low");
++	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
++		uint8_t id[2] = { 0, 0 };
++		bool ok;
++
++		bit_us = rates[i];
++		i2c_bus_recover();
++		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
++		printf("UMI TOUCH: bit_us %2u: id %02x %02x (%s)\n", bit_us, id[0], id[1],
++		    ok ? "acked" : "not acked");
++		line_release(pin_sda);
++		umi_spin_ms(1);
++		printf("UMI TOUCH: sda a millisecond later  %u%s\n", gpio_get(pin_sda),
++		    gpio_get(pin_sda) ? "" : "   <- the chip is holding the line down");
++	}
++	bit_us = saved;
++}
++
++/*
++ * umi_touch_proto=1: is the acknowledge ours, and is 0xB6 the opcode?
++ *
++ * Two things in a register read are assumptions rather than facts: that 0x49
++ * is this panel (the same overlay carries focaltech@38, so 0x48 has to stay
++ * silent for the acknowledge to mean anything), and that 0xB6 is the byte that
++ * means "hardware register". A slave acknowledges *any* byte sent to its
++ * address, so a wrong opcode is not a failure at the electrical level -- it is
++ * a command the chip does not understand, answered with zeros, which is the
++ * same map a chip with a dark core gives. Sixteen opcodes and a write and
++ * read-back say which of the two this is, and sense-on afterwards asks whether
++ * a core that is running will start scanning.
++ */
++static void
++protocol_scan(void)
++{
++	static const uint8_t opcodes[] = {
++		0xb6, 0xb7, 0xb5, 0xb4, 0xd0, 0xd1, 0xc0, 0xc1,
++		0x80, 0x86, 0x90, 0xa0, 0xb0, 0xe0, 0x5a, 0x4b,
++	};
++	uint8_t data[4];
++	unsigned nonzero = 0;
++	bool present;
++
++	printf("UMI TOUCH: --- is the acknowledge ours? 0x48 has to stay silent ---\n");
++	i2c_ack_reset();
++	i2c_start();
++	present = i2c_write_byte((uint8_t)(0x48 << 1));
++	i2c_stop();
++	printf("UMI TOUCH:   0x48: %s\n", present ? "ACKNOWLEDGES -- so 0x49 means nothing" : "silent");
++	i2c_ack_reset();
++	i2c_start();
++	present = i2c_write_byte((uint8_t)(0x49 << 1));
++	i2c_stop();
++	printf("UMI TOUCH:   0x49: %s\n", present ? "acknowledges" : "SILENT");
++
++	printf("UMI TOUCH: --- the id register through sixteen opcodes ---\n");
++	for (unsigned i = 0; i < sizeof(opcodes); i++) {
++		bool ok;
++
++		memset(data, 0, sizeof(data));
++		ok = fts_read_raw(opcodes[i], FTS_CHIP_ID_ADDR_A, data, sizeof(data));
++		if (!ok) {
++			char mask[ACK_MASK_MAX];
++
++			ack_string(mask, sizeof(mask));
++			printf("UMI TOUCH: op %02x: ack %s, not acknowledged\n", opcodes[i], mask);
++			continue;
++		}
++		for (unsigned b = 0; b < sizeof(data); b++) {
++			if (data[b]) {
++				nonzero++;
++			}
++		}
++		printf("UMI TOUCH: op %02x: %02x %02x %02x %02x\n", opcodes[i],
++		    data[0], data[1], data[2], data[3]);
++	}
++	if (nonzero == 0) {
++		printf("UMI TOUCH: every opcode answered zero, so the opcode is not the problem\n");
++	}
++
++	printf("UMI TOUCH: --- write 0x5a and read it back, sixteen addresses ---\n");
++	for (unsigned address = 0; address < 0x100; address += 0x10) {
++		uint8_t want = 0x5a, back = 0;
++
++		if (!fts_write_registers((uint16_t)address, &want, 1)) {
++			printf("UMI TOUCH: %04x: the write was not acknowledged\n", address);
++			continue;
++		}
++		if (!fts_read_registers((uint16_t)address, &back, 1)) {
++			printf("UMI TOUCH: %04x: written, the read was not acknowledged\n", address);
++			continue;
++		}
++		printf("UMI TOUCH: %04x <- 5a, read back %02x%s\n", address, back,
++		    back == want ? "   <- it stuck" : "");
++	}
++
++	printf("UMI TOUCH: --- sense on, then the id again ---\n");
++	printf("UMI TOUCH: command %02x: %s\n", FTS_CMD_SENSE_ON,
++	    fts_command(FTS_CMD_SENSE_ON) ? "acknowledged" : "not acknowledged");
++	umi_spin_ms(50);
++	for (unsigned i = 0; i < 3; i++) {
++		uint8_t id[2] = { 0, 0 };
++		bool ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
++
++		printf("UMI TOUCH: id %u: %02x %02x (%s), int %u\n", i, id[0], id[1],
++		    ok ? "acked" : "not acked", gpio_get(PIN_INT));
++	}
++}
++
+ /* One try at one pin order: reset the chip, let it boot, ask who it is. */
+ static bool
+ probe(unsigned sda, unsigned scl)
+@@ -721,7 +1096,12 @@
+ 
+ 	pin_sda = sda;
+ 	pin_scl = scl;
++	id_reads = id_acked = id_naked = id_zero = 0;
++	scl_clocks = scl_slow = 0;
+ 	pins_for_i2c();
++	if (clear_pulses) {
++		i2c_clock_clear(clear_pulses);
++	}
+ 	i2c_bus_recover();
+ 
+ 	/*
+@@ -730,15 +1110,25 @@
+ 	 * umi_touch_reset picks the level the sequence settles at: 1 high (the
+ 	 * vendor's), 0 low, 2 leaves the line alone. Either way the pulse goes
+ 	 * the other way first, so there is a real edge.
++	 *
++	 * umi_touch_reset_pulses=N sends more than one, each followed by the
++	 * whole settle time: the reference driver ends up pulsing twice (its
++	 * probe does the reset, waits, then does it again and waits again), and
++	 * a part whose application had to be started twice by the loader would
++	 * come up on the second edge and not the first.
+ 	 */
+ 	if (reset_mode != 2) {
+ 		bool settle_high = reset_mode != 0;
+ 
+-		gpio_set(PIN_RESET, !settle_high);
+-		umi_spin_ms(2);
+-		gpio_set(PIN_RESET, settle_high);
++		for (uint32_t i = 0; i < reset_pulses; i++) {
++			gpio_set(PIN_RESET, !settle_high);
++			umi_spin_ms(2);
++			gpio_set(PIN_RESET, settle_high);
++			umi_spin_ms(settle_ms); /* fts_reset_proc, then time to boot the application */
++		}
++	} else {
++		umi_spin_ms(settle_ms);
+ 	}
+-	umi_spin_ms(settle_ms);         /* fts_reset_proc, then time to boot the application */
+ 
+ 	for (int attempt = 0; attempt < 5; attempt++) {
+ 		if (read_chip_id(&high, &low)) {
+@@ -748,9 +1138,25 @@
+ 		}
+ 		umi_spin_ms(50);
+ 	}
+-	if (umi_verbose) {
+-		printf("UMI TOUCH: no answer at %#x on sda gpio%u / scl gpio%u\n",
+-		    I2C_ADDRESS, pin_sda, pin_scl);
++	/*
++	 * Say what actually happened, and say it in the only two terms that
++	 * lead anywhere: did anything acknowledge, and did the thing that
++	 * acknowledged have a register file. The old line said "no answer" for
++	 * both, and the chip has been answering all along.
++	 */
++	if (scl_slow) {
++		printf("UMI TOUCH: clocks: %u of %u never went high within %u us\n",
++		    scl_slow, scl_clocks, scl_limit_us);
++	}
++	printf("UMI TOUCH: 0x%02x on sda gpio%u / scl gpio%u: %u id reads, %u acknowledged, "
++	    "%u not acknowledged, %u answered 00 00\n",
++	    I2C_ADDRESS, pin_sda, pin_scl, id_reads, id_acked, id_naked, id_zero);
++	if (id_acked && id_naked == 0 && id_zero == id_acked) {
++		printf("UMI TOUCH: 0x%02x acknowledges every byte and answers 0x00 to every "
++		    "register: the interface is answering and the register file is not\n", I2C_ADDRESS);
++	} else if (id_naked) {
++		printf("UMI TOUCH: 0x%02x did not acknowledge: nothing is at that address on "
++		    "these two pins\n", I2C_ADDRESS);
+ 	}
+ 	return false;
+ }
+@@ -776,10 +1182,26 @@
+ 	}
+ }
+ 
++/*
++ * The two bus lines on their own, with the reset left exactly where the last
++ * step put it. The diagnostics need this and not pins_for_i2c(): that one
++ * pulls reset low (the chip is held in reset until probe() asks for it), and a
++ * bus scan or an opcode walk taken through a chip that is being held in reset
++ * answers nothing at all -- which is the one result the scan must not produce
++ * by accident.
++ */
++static void
++pins_for_bus(void)
++{
++	line_release(pin_sda);
++	scl_high();
++}
++
+ static void
+ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+ 	uint32_t diag = 0, avdd = 0, swap = 0, pp = 0, v = 0;
++	uint32_t ack = 0, scan = 0, mon = 0, proto = 0, clr = 0, pulses = 0;
+ 	unsigned idle = 0, idle_looks;
+ 	bool found = false;
+ 
+@@ -794,6 +1216,22 @@
+ 	(void)PE_parse_boot_argn("umi_touch_poll_us", &poll_us, sizeof(poll_us));
+ 	(void)PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
+ 	(void)PE_parse_boot_argn("umi_touch_reset", &reset_mode, sizeof(reset_mode));
++	(void)PE_parse_boot_argn("umi_touch_ack", &ack, sizeof(ack));
++	(void)PE_parse_boot_argn("umi_touch_scan", &scan, sizeof(scan));
++	(void)PE_parse_boot_argn("umi_touch_intmon", &mon, sizeof(mon));
++	(void)PE_parse_boot_argn("umi_touch_proto", &proto, sizeof(proto));
++	(void)PE_parse_boot_argn("umi_touch_clear", &clr, sizeof(clr));
++	(void)PE_parse_boot_argn("umi_touch_reset_pulses", &pulses, sizeof(pulses));
++	umi_ack = ack != 0;
++	umi_scan = scan != 0;
++	umi_intmon = mon != 0;
++	umi_proto = proto != 0;
++	if (clr <= 1024) {
++		clear_pulses = clr;
++	}
++	if (pulses >= 1 && pulses <= 4) {
++		reset_pulses = pulses;
++	}
+ 	pushpull = pp != 0;
+ 	if (bit_us < 1 || bit_us > 1000) {
+ 		bit_us = 3;
+@@ -865,6 +1303,22 @@
+ 		umi_spin_ms(5);
+ 	}
+ 	/*
++	 * The two readings that have to be taken before anything is written to
++	 * the chip: who else is on the bus (umi_touch_scan=1), and what the
++	 * interrupt line does through one reset (umi_touch_intmon=1). Both are
++	 * on the pins the driver is about to use, so the pins are configured
++	 * for I2C first; neither writes a byte to the chip.
++	 */
++	if (umi_scan) {
++		pins_for_bus();
++		i2c_bus_recover();
++		i2c_scan();
++	}
++	if (umi_intmon) {
++		pins_for_bus();
++		int_monitor();
++	}
++	/*
+ 	 * Which of gpio36/gpio37 is SDA and which is SCL is not written down
+ 	 * anywhere, and the wrong way round is not an error the chip can report.
+ 	 * So both are tried, and only the one that answers is kept.
+@@ -880,9 +1334,19 @@
+ 		}
+ 		found = probe(sda, scl);
+ 	}
++	/*
++	 * umi_touch_proto=1: what the thing at 0x49 answers when the opcode is
++	 * not assumed to be 0xB6, and whether a write sticks anywhere. It runs
++	 * on the failure path as well as the success one -- a part that
++	 * acknowledges and answers zero is exactly the case it exists for.
++	 */
++	if (umi_proto) {
++		pins_for_bus();
++		protocol_scan();
++	}
+ 	if (!found) {
+ 		printf("UMI TOUCH: no FingerTipS touch screen on I2C %#x\n", I2C_ADDRESS);
+-		show_pins("no answer");
++		show_pins("not answering");
+ 		goto out;
+ 	}
+ 	show_pins("answering");
