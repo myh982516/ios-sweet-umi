@@ -58,6 +58,17 @@
  	if (swap) {
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
+@@ -218,9 +218,9 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned mv, unsigned enable)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
 @@ -267,10 +267,11 @@
  	/* From here an uncertain write/timeout quarantines our slot for this boot. */
  	rh_poisoned = true;
@@ -87,3 +98,14 @@
  	/*
  	 * Board-specific helper: do not apply one PMIC policy to arbitrary
  	 * resources. Allowed, with the voltages each rail is asked for:
+@@ -377,9 +384,9 @@
+ 	if (!error) {
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		error = rh_send(address, mv, enable);
+ 	}
+ out:
+ 	if (error) {
+ 		printf("SWEET RPMH: enable failed errno=%d\n", error);
